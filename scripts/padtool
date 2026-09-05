@@ -964,11 +964,8 @@ def cmd_test(key, node, as_json):
             print(f"\033[32mFlashed\033[0m {flashed['firmware']} -- now "
                   "checking the hardware.")
         print(f"\n\033[1m{model['name']}\033[0m -- {pad['device']}{extra}")
-        print(f"Hold each input for {HOLD_SECS:g}s. Anything naming a modifier "
-              f"means hold the modifier and the input together.")
-        print(f"\033[36m*\033[0m marks an input that is active right now. "
-              f"Exits on its own once all {total} inputs pass. "
-              f"Ctrl-C to give up.\n")
+        print(f"Hold each input for {HOLD_SECS:g}s.")
+        print(f"Ctrl-C to give up.\n")
 
     drawn = {"rows": 0, "last": None}
 
@@ -1129,7 +1126,7 @@ def cmd_test(key, node, as_json):
         elif missing:
             print(f"\033[31mFAIL\033[0m -- never held: {', '.join(missing)}")
         else:
-            print(f"\033[32mPASS\033[0m -- all {total} inputs held steady.")
+            print(f"\033[32mPASS\033[0m -- all {total} inputs detected.")
     if gone:
         return 1                    # aborted, as opposed to 2 for a real fail
     return 0 if not missing else 2
