@@ -1,0 +1,640 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p python3 --pure
+"""
+padtool - verify every input on a Granola controller.
+
+  padtool <model> [event#]   find that model and test its inputs (--json ok)
+  padtool models             list the models this script knows about
+  padtool list               dump every connected pad's raw attributes
+  padtool probe [event#] [s] watch a pad live -- how a new profile is built
+
+Naming the model is deliberate: our controllers present themselves as
+off-the-shelf pads, so the script cannot tell one of ours from another.
+You say what you plugged in; the script checks something matching it is
+there and refuses to run if it is not.
+
+Reads evdev directly. Python stdlib only, no evdev/SDL bindings.
+"""
+import sys, os, re, time, glob, json, struct, select, fcntl
+
+# struct input_event on 64-bit: time_sec, time_usec, type, code, value
+EV_FMT = "llHHi"
+EV_SIZE = struct.calcsize(EV_FMT)
+EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
+
+BTN = {
+    304: "A",             305: "B",             306: "C",
+    307: "X",             308: "Y",             309: "Z",
+    310: "L1 / LB",       311: "R1 / RB",       312: "L2 (digital)",
+    313: "R2 (digital)",  314: "Select / Back", 315: "Start",
+    316: "Guide / Home",  317: "L3 (stick)",    318: "R3 (stick)",
+    544: "D-pad Up",      545: "D-pad Down",    546: "D-pad Left",
+    547: "D-pad Right",
+}
+ABS = {
+    0: "Left stick X",  1: "Left stick Y",  2: "L2 trigger",
+    3: "Right stick X", 4: "Right stick Y", 5: "R2 trigger",
+    16: "D-pad X (hat)", 17: "D-pad Y (hat)",
+}
+
+SHORT = {0: "LX", 1: "LY", 2: "L2", 3: "RX", 4: "RY", 5: "R2",
+         16: "HatX", 17: "HatY"}
+
+# ---------------------------------------------------------------------------
+# Controller models we build and sell.
+#
+# A model is a USB identity plus an ordered list of checks. Each check is one
+# thing an operator does to the controller, and one line on the checklist:
+#
+#   button(code)              a digital button, held down
+#   sweep(code)               an axis pushed to BOTH of its declared stops
+#   at(code, value, label)    an axis parked on one specific value
+#
+# `at` is what makes a modifier testable. A modifier that only changes what
+# the stick reports emits nothing on its own, so it cannot be tested alone --
+# but held together with a direction it produces a coordinate no other input
+# produces, and landing on that coordinate is proof the modifier works.
+#
+# Every number below was measured off a known-good controller with
+# `padtool probe`. None of it is derived from firmware or guessed.
+#
+#   presents_as  what the pad claims to be over USB. Ours run stock firmware
+#                personalities, so this is not unique to us -- a genuine pad
+#                of the same kind would also match. That is fine: it only has
+#                to be specific enough to catch "wrong thing plugged in".
+# ---------------------------------------------------------------------------
+
+def button(code, label=None):
+    return {"kind": "button", "code": code, "label": label or BTN[code]}
+
+
+def sweep(code, label=None):
+    return {"kind": "sweep", "code": code, "label": label or ABS[code]}
+
+
+def at(code, value, label, tol=1500):
+    return {"kind": "at", "code": code, "value": value, "tol": tol,
+            "label": label}
+
+
+MODELS = {
+    "beacon": {
+        "name": "Granola Beacon",
+        "presents_as": "wired Xbox 360 pad (XInput)",
+        "vid": 0x045e, "pid": 0x028e,
+        # No right stick (ABS 3/4) and no d-pad (hat ABS 16/17) on this model.
+        "inputs": [button(c) for c in (304, 305, 307, 308, 310, 311,
+                                       314, 315, 316, 317, 318)]
+                  + [sweep(c) for c in (0, 1, 2, 5)],
+    },
+    "plateau": {
+        "name": "Granola Plateau",
+        "presents_as": "wired Xbox 360 pad (XInput, Mad Catz ID)",
+        "vid": 0x0738, "pid": 0x4726,
+        "inputs": [
+            button(304), button(305), button(307), button(308),
+            button(311, "Z"), button(315),
+
+            # Directions are analog, not hat or button. A press drives the
+            # stick to centre +/-80 in the controller's own 8-bit space and
+            # never to the axis stops, so these cannot use sweep().
+            at(0, -20432, "Left"),                  # 8-bit  48
+            at(0,  20688, "Right"),                 #       208
+            at(1, -20689, "Up"),                    #       208
+            at(1,  20431, "Down"),                  #        48
+
+            at(3, -20432, "C-stick Left"),
+            at(3,  20688, "C-stick Right"),
+            at(4, -20689, "C-stick Up"),
+            at(4,  20431, "C-stick Down"),
+
+            # Each trigger button sits at its own fixed partial pull, so each
+            # is a separate check rather than a sweep. Tolerance is tight
+            # because 49 and 94 are only 45 apart.
+            at(2, 255, "L",             tol=10),
+            at(5, 255, "R",             tol=10),
+            at(5,  49, "Light Shield",  tol=10),
+            at(5,  94, "Medium Shield", tol=10),
+
+            # One direction is enough to prove a modifier works: held with
+            # Left it produces a coordinate nothing else on the controller
+            # produces. Mod X pulls horizontal travel in to 53/80, Mod Y to
+            # 27/80, and the d-pad mod moves the C-stick onto the hat while
+            # RX/RY stay at rest.
+            at(0, -13493, "Mod X + Left"),
+            at(0,  -6811, "Mod Y + Left"),
+            at(16,    -1, "D-pad mod + C-Left", tol=0),
+        ],
+    },
+}
+
+
+def req_codes(model):
+    """The evdev codes a model's checks need the device to offer."""
+    return ([c["code"] for c in model["inputs"] if c["kind"] == "button"],
+            [c["code"] for c in model["inputs"] if c["kind"] != "button"])
+
+
+def _read(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def _bit_is_set(hexstr, bit):
+    """Parse a sysfs capability bitmap ('7cdb000000000000 0 0 0 0')."""
+    words = hexstr.split()
+    if not words:
+        return False
+    val = int("".join(w.zfill(16) for w in words) or "0", 16)
+    return bool(val >> bit & 1)
+
+
+def gamepads():
+    """Every evdev node that reports gamepad buttons."""
+    out = []
+    for path in sorted(glob.glob("/sys/class/input/event*"),
+                       key=lambda p: int(p.rsplit("event", 1)[1])):
+        keybits = _read(os.path.join(path, "device/capabilities/key"))
+        absbits = _read(os.path.join(path, "device/capabilities/abs"))
+        # BTN_SOUTH (304) or BTN_TRIGGER (288) => it's a pad/stick, not a keyboard
+        if not (_bit_is_set(keybits, 304) or _bit_is_set(keybits, 288)):
+            continue
+        d = os.path.join(path, "device")
+        vid = int(_read(f"{d}/id/vendor", "0") or "0", 16)
+        pid = int(_read(f"{d}/id/product", "0") or "0", 16)
+        # which kernel driver claimed it -- xpad, hid-generic, hid-nintendo...
+        driver, cur = "", os.path.realpath(d)
+        for _ in range(6):
+            cur = os.path.dirname(cur)
+            drv = os.path.join(cur, "driver")
+            if os.path.islink(drv):
+                driver = os.path.basename(os.path.realpath(drv))
+                break
+        # walk up to the USB device for the descriptor strings
+        usb, cur = {}, os.path.realpath(d)
+        for _ in range(6):
+            cur = os.path.dirname(cur)
+            if os.path.exists(os.path.join(cur, "idVendor")):
+                usb = {k: _read(f"{cur}/{k}") for k in
+                       ("manufacturer", "product", "serial")}
+                break
+        out.append({
+            "event": os.path.basename(path),
+            "device": f"/dev/input/{os.path.basename(path)}",
+            "name": _read(os.path.join(path, "device/name")),
+            "vid": f"{vid:04x}", "pid": f"{pid:04x}",
+            "_vid": vid, "_pid": pid,
+            "driver": driver,
+            "usb_manufacturer": usb.get("manufacturer", ""),
+            "usb_product": usb.get("product", ""),
+            "usb_serial": usb.get("serial", ""),
+            "buttons": [c for c in BTN if _bit_is_set(keybits, c)],
+            "axes": [c for c in ABS if _bit_is_set(absbits, c)],
+            "readable": os.access(f"/dev/input/{os.path.basename(path)}", os.R_OK),
+        })
+    return out
+
+
+def matches(pad, model):
+    """Could this pad be one of ours?
+
+    USB identity plus a check that the pad actually offers every input the
+    model is supposed to have -- that second half is what catches a pad that
+    borrowed the same VID:PID but exposes a different layout.
+    """
+    if (pad["_vid"], pad["_pid"]) != (model["vid"], model["pid"]):
+        return False
+    btn, axs = req_codes(model)
+    return set(btn) <= set(pad["buttons"]) and set(axs) <= set(pad["axes"])
+
+
+def find(model):
+    return [p for p in gamepads() if matches(p, model)]
+
+
+# EVIOCGABS(code) = _IOR('E', 0x40 + code, sizeof(struct input_absinfo))
+# struct input_absinfo { __s32 value, minimum, maximum, fuzz, flat, resolution; }
+ABSINFO_FMT = "=6i"
+def _eviocgabs(code):
+    return (2 << 30) | (struct.calcsize(ABSINFO_FMT) << 16) | (0x45 << 8) | (0x40 + code)
+
+# How much slack to allow at each end before calling an axis at its stop.
+AXIS_TOL = 0.10
+
+# A momentary contact is not a working input. Nothing is credited until it has
+# been held this long without interruption -- a button pressed and kept down,
+# an axis parked at one of its stops.
+HOLD_SECS = 1.0
+
+
+def absinfo(fd, codes):
+    """Ask the driver, per axis, where it is resting and what range it reports.
+
+    A 360 pad declares -32768..32767 for sticks and 0..255 for triggers, so a
+    single hardcoded threshold cannot work. Returns {code: (value, lo, hi)},
+    or None for an axis the driver declares but never drives.
+    """
+    out = {}
+    for c in codes:
+        try:
+            buf = fcntl.ioctl(fd, _eviocgabs(c),
+                              b"\0" * struct.calcsize(ABSINFO_FMT))
+            val, lo, hi, _, _, _ = struct.unpack(ABSINFO_FMT, buf)
+            out[c] = (val, lo, hi) if hi > lo else None
+        except OSError:
+            pass                # unknown: fall back to any-movement
+    return out
+
+
+def cmd_models():
+    for key, m in MODELS.items():
+        total = len(m["inputs"])
+        print(f"  \033[1m{key:<10}\033[0m {m['name']}  --  {total} inputs, "
+              f"presents as {m['presents_as']}")
+        print(f"             found: {len(find(m))} connected")
+    return 0
+
+
+def cmd_list(as_json):
+    """Every pad attached, with the raw attributes a new profile is built from."""
+    pads = gamepads()
+    for p in pads:
+        p["matches"] = [k for k, m in MODELS.items() if matches(p, m)]
+    if as_json:
+        print(json.dumps(pads, indent=2))
+        return 0 if pads else 1
+    if not pads:
+        print("No gamepads found.")
+        return 1
+    for p in pads:
+        hits = p["matches"]
+        print(f"\n\033[1m{p['name']}\033[0m  ({p['device']})")
+        print(f"  USB ID        : {p['vid']}:{p['pid']}")
+        if p["usb_product"]:
+            print(f"  USB strings   : {p['usb_manufacturer']} / {p['usb_product']}"
+                  + (f" / SN {p['usb_serial']}" if p["usb_serial"] else ""))
+        print(f"  kernel driver : {p['driver'] or 'none'}")
+        print(f"  buttons ({len(p['buttons']):>2})  : "
+              + ", ".join(f"{c} {BTN[c]}" for c in p["buttons"]))
+        print(f"  axes    ({len(p['axes']):>2})  : "
+              + ", ".join(f"{c} {ABS[c]}" for c in p["axes"]))
+        print(f"  matches model : {', '.join(hits) if hits else 'none'}")
+        if not p["readable"]:
+            print("  \033[33m! not readable by you -- add yourself to the 'input' group\033[0m")
+    print()
+    return 0
+
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def vis(text):
+    """Printed width, ignoring colour escapes."""
+    return len(ANSI.sub("", text))
+
+
+def padv(text, width):
+    return text + " " * max(0, width - vis(text))
+
+
+def check_token(spec, held, vals, declared, rest):
+    """What this check currently satisfies, or None.
+
+    Reducing every kind of check to a single token keeps the hold logic
+    uniform: whatever the token is, it has to stay put for HOLD_SECS.
+    """
+    if spec["kind"] == "button":
+        return "down" if spec["code"] in held else None
+    v = vals.get(spec["code"])
+    if v is None:
+        return None
+    if spec["kind"] == "at":
+        return "at" if abs(v - spec["value"]) <= spec["tol"] else None
+    rng = declared.get(spec["code"])
+    if not rng:                     # driver declared no usable range
+        return "moved" if v != rest.get(spec["code"]) else None
+    lo, hi = rng
+    tol = (hi - lo) * AXIS_TOL
+    if v <= lo + tol:
+        return "min"
+    if v >= hi - tol:
+        return "max"
+    return None
+
+
+def check_needs(spec, declared):
+    """Every token a check must collect before it counts as verified."""
+    if spec["kind"] == "button":
+        return {"down"}
+    if spec["kind"] == "at":
+        return {"at"}
+    return {"min", "max"} if declared.get(spec["code"]) else {"moved"}
+
+
+def cmd_test(key, node, as_json):
+    model = MODELS[key]
+    found = find(model)
+    if node:
+        # An explicit node still has to look like the model -- naming it picks
+        # which pad to test, it does not waive the check.
+        found = [p for p in found if node in (p["event"], p["device"])]
+        msg = f"{node} is not a {model['name']} -- expected a {model['presents_as']}."
+    else:
+        msg = f"No {model['name']} found -- expected a {model['presents_as']}."
+    if not found:
+        if as_json:
+            print(json.dumps({"model": key, "found": False, "pass": False,
+                              "error": msg}, indent=2))
+        else:
+            print(f"\033[31m{msg}\033[0m", file=sys.stderr)
+            print("Plug one in, or run 'padtool list' to see what is attached.",
+                  file=sys.stderr)
+        return 1
+    pad = found[0]
+
+    specs = model["inputs"]
+    total = len(specs)
+    _, want_abs = req_codes(model)
+
+    try:
+        f = open(pad["device"], "rb", buffering=0)
+    except PermissionError:
+        print(f"Cannot read {pad['device']} -- add yourself to the 'input' group.",
+              file=sys.stderr)
+        return 1
+    info = absinfo(f, want_abs)
+    declared = {c: (v[1], v[2]) for c, v in info.items() if v}
+    rest = {c: v[0] for c, v in info.items() if v}
+
+    held, vals = set(), dict(rest)
+    span = {c: (v, v) for c, v in rest.items()}     # observed travel, for JSON
+    needs = [check_needs(sp, declared) for sp in specs]
+    got = [set() for _ in specs]
+    cur = [(None, 0.0) for _ in specs]              # (token, since when)
+
+    if not as_json:
+        extra = f"  (+{len(found) - 1} more connected)" if len(found) > 1 else ""
+        print(f"\n\033[1m{model['name']}\033[0m -- {pad['device']}{extra}")
+        print(f"Hold each input for {HOLD_SECS:g}s. Anything naming a modifier "
+              f"means hold the modifier and the input together.")
+        print(f"\033[36m*\033[0m marks an input that is active right now. "
+              f"Exits on its own once all {total} inputs pass. "
+              f"Ctrl-C to give up.\n")
+
+    drawn = {"rows": 0, "last": None}
+
+    def ok(i):
+        return needs[i] <= got[i]
+
+    def settle(now):
+        for i, sp in enumerate(specs):
+            tok = check_token(sp, held, vals, declared, rest)
+            prev, since = cur[i]
+            if tok != prev:
+                cur[i] = (tok, now)
+                since = now
+            if tok and now - since >= HOLD_SECS:
+                got[i].add(tok)
+
+    def complete():
+        return all(ok(i) for i in range(total))
+
+    def active(i):
+        """Engaged this instant -- pressed, or parked on the wanted value.
+
+        settle() refreshes cur[] every tick, so this stays current whether or
+        not the check has already been verified.
+        """
+        return cur[i][0] is not None
+
+    def mark(good):
+        return "\033[32mx\033[0m" if good else " "
+
+    def note_for(i, now):
+        """Countdown while a hold is in progress, blank otherwise."""
+        tok, since = cur[i]
+        if not tok or tok in got[i]:
+            return ""
+        left = HOLD_SECS - (now - since)
+        return f"hold {left:.1f}s" if left > 0 else ""
+
+    def detail_for(i):
+        """The middle column: what the check is watching right now."""
+        sp = specs[i]
+        if sp["kind"] == "button":
+            return "", ""
+        v = vals.get(sp["code"])
+        if sp["kind"] == "at":
+            tol = f" +/-{sp['tol']}" if sp["tol"] else ""
+            return (f"{SHORT.get(sp['code'], sp['code'])}={v}" if v is not None
+                    else "--"), f"want {sp['value']}{tol}"
+        rng = declared.get(sp["code"])
+        stops = f"min[{mark('min' in got[i])}] max[{mark('max' in got[i])}]"
+        return stops, (f"of {rng[0]}..{rng[1]}" if rng else "any movement")
+
+    def render(now):
+        if as_json:
+            return
+        done = sum(1 for i in range(total) if ok(i))
+
+        lines = []
+        for i, sp in enumerate(specs):
+            detail, target = detail_for(i)
+            note = note_for(i, now)
+            note = f"\033[2m{padv(note, 10)}\033[0m" if note else " " * 10
+            live = "\033[36m*\033[0m" if active(i) else " "
+            lines.append(f"  [{mark(ok(i))}] {live} {padv(sp['label'], 22)} "
+                         f"{padv(detail, 15)} {note}  {target}".rstrip())
+        lines.append("")
+        lines.append(f"  {done}/{total} inputs verified")
+
+        block = "\n".join(lines)
+        if block == drawn["last"]:
+            return          # nothing changed -- do not redraw on axis spam
+        drawn["last"] = block
+
+        out = []
+        if drawn["rows"]:
+            out.append(f"\033[{drawn['rows']}A")   # back to top of our block
+        for ln in lines:
+            out.append("\033[2K" + ln + "\n")   # clear the row, then rewrite it
+        # If this frame is shorter than the last, wipe the leftover rows.
+        for _ in range(max(0, drawn["rows"] - len(lines))):
+            out.append("\033[2K\n")
+        if drawn["rows"] > len(lines):
+            out.append(f"\033[{drawn['rows'] - len(lines)}A")
+        drawn["rows"] = len(lines)
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+
+    render(time.monotonic())
+    finished = False
+    try:
+        with f:
+            while True:
+                if select.select([f], [], [], 0.05)[0]:
+                    data = f.read(EV_SIZE)
+                    if data and len(data) == EV_SIZE:
+                        _, _, etype, code, value = struct.unpack(EV_FMT, data)
+                        # Inputs no check cares about are ignored, not counted:
+                        # the driver declares a whole standard layout whatever
+                        # the model actually has wired up.
+                        if etype == EV_KEY:
+                            if value == 1:
+                                held.add(code)
+                            elif value == 0:
+                                held.discard(code)
+                        elif etype == EV_ABS:
+                            vals[code] = value
+                            lo, hi = span.get(code, (value, value))
+                            span[code] = (min(lo, value), max(hi, value))
+                now = time.monotonic()
+                settle(now)
+                render(now)
+                if complete():
+                    finished = True
+                    break
+    except KeyboardInterrupt:
+        pass
+
+    if finished and not as_json:
+        time.sleep(0.4)         # let the completed checklist land on screen
+
+    missing = [sp["label"] for i, sp in enumerate(specs) if not ok(i)]
+    if as_json:
+        print(json.dumps({
+            "model": key, "found": True, "device": pad,
+            "pass": not missing,
+            "hold_seconds": HOLD_SECS,
+            "verified": [sp["label"] for i, sp in enumerate(specs) if ok(i)],
+            "missing": missing,
+            "checks": [{
+                "label": sp["label"], "kind": sp["kind"], "code": sp["code"],
+                "ok": ok(i), "needs": sorted(needs[i]), "held": sorted(got[i]),
+                "target": sp.get("value"), "tol": sp.get("tol"),
+                "observed": list(span[sp["code"]]) if sp["code"] in span else None,
+            } for i, sp in enumerate(specs)],
+        }, indent=2))
+    else:
+        print()
+        if missing:
+            print(f"\033[31mFAIL\033[0m -- never held: {', '.join(missing)}")
+        else:
+            print(f"\033[32mPASS\033[0m -- all {total} inputs held steady.")
+    return 0 if not missing else 2
+
+
+def cmd_probe(node, seconds):
+    """Watch a pad and report what it actually does.
+
+    This is how a profile for a new model gets built: press things and read
+    off the codes, rather than guessing from firmware or product names. It
+    prints one line per settled state, so a modifier held together with a
+    direction shows up as the coordinates it actually produces.
+    """
+    pads = gamepads()
+    if node:
+        pads = [p for p in pads if node in (p["event"], p["device"])]
+    if not pads:
+        print(f"{node} is not a gamepad." if node else "No gamepads found.",
+              file=sys.stderr)
+        return 1
+    pad = pads[0]
+    try:
+        f = open(pad["device"], "rb", buffering=0)
+    except PermissionError:
+        print(f"Cannot read {pad['device']} -- add yourself to the 'input' group.",
+              file=sys.stderr)
+        return 1
+
+    info = absinfo(f, pad["axes"])
+    rest = {c: v[0] for c, v in info.items() if v}
+    rng = {c: (v[1], v[2]) for c, v in info.items() if v}
+    cur, span = dict(rest), {c: (v, v) for c, v in rest.items()}
+    held, order = set(), []
+
+    print(f"\nProbing \033[1m{pad['name']}\033[0m ({pad['device']}) "
+          f"for {seconds:g}s.")
+    print("Every settled state is printed. Axes are shown only when they are "
+          "away from rest.\n")
+    t0 = last_ev = time.monotonic()
+    shown, dirty = None, False
+    with f:
+        while time.monotonic() - t0 < seconds:
+            if select.select([f], [], [], 0.05)[0]:
+                data = f.read(EV_SIZE)
+                if data and len(data) == EV_SIZE:
+                    _, _, etype, code, value = struct.unpack(EV_FMT, data)
+                    if etype == EV_KEY and code in BTN:
+                        if value == 1:
+                            held.add(code)
+                            if code not in order:
+                                order.append(code)
+                        elif value == 0:
+                            held.discard(code)
+                        last_ev, dirty = time.monotonic(), True
+                    elif etype == EV_ABS and code in ABS:
+                        cur[code] = value
+                        lo, hi = span.get(code, (value, value))
+                        span[code] = (min(lo, value), max(hi, value))
+                        last_ev, dirty = time.monotonic(), True
+            now = time.monotonic()
+            # Wait for things to stop moving before printing, so one flick of a
+            # stick is a single line rather than fifty.
+            if dirty and now - last_ev > 0.12:
+                off = {c: v for c, v in cur.items() if v != rest.get(c)}
+                state = (tuple(sorted(held)), tuple(sorted(off.items())))
+                if state != shown:
+                    shown = state
+                    btxt = " ".join(BTN[c] for c in sorted(held)) or "\033[2m--\033[0m"
+                    atxt = "  ".join(f"{SHORT.get(c, c)}={v:+d}"
+                                     for c, v in sorted(off.items()))
+                    print(f"  {now - t0:5.2f}s  {btxt:<34} {atxt}")
+                dirty = False
+
+    print(f"\n\033[1mButtons seen\033[0m ({len(order)}), in the order pressed:")
+    for c in order:
+        print(f"  {c}  {BTN[c]}")
+    if not order:
+        print("  none")
+    print(f"\n\033[1mAxis travel\033[0m:")
+    for c in sorted(span):
+        lo, hi = span[c]
+        r = rest.get(c, 0)
+        d = rng.get(c)
+        tail = f"  declared {d[0]:>7}..{d[1]:<7}" if d else "  (no range declared)"
+        if (lo, hi) == (r, r):
+            tail += "  \033[2m(never moved)\033[0m"
+        print(f"  {SHORT.get(c, c):<5} {ABS[c]:<16} rest {r:>7}  "
+              f"seen {lo:>7}..{hi:<7}{tail}")
+    print()
+    return 0
+
+
+def main():
+    args = [a for a in sys.argv[1:]]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    cmd = args[0] if args else ""
+    if cmd in MODELS:
+        return cmd_test(cmd, args[1] if len(args) > 1 else None, as_json)
+    if cmd == "models":
+        return cmd_models()
+    if cmd == "list":
+        return cmd_list(as_json)
+    if cmd == "probe":
+        node = args[1] if len(args) > 1 else None
+        secs = float(args[2]) if len(args) > 2 else 30.0
+        return cmd_probe(node, secs)
+    if cmd:
+        print(f"Unknown model or command: {cmd}\n", file=sys.stderr)
+    print(__doc__)
+    print("Models: " + ", ".join(MODELS) + "\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
