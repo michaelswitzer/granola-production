@@ -5,6 +5,7 @@ padtool - verify every input on a Granola controller.
 
   padtool <model> [event#]   find that model and test its inputs (--json ok)
   padtool flash <model>      write that model's firmware to a blank board
+  padtool nuke               erase a board's flash back to factory blank
   padtool models             list the models this script knows about
   padtool list               dump every connected pad's raw attributes
   padtool probe [event#] [s] watch a pad live -- how a new profile is built
@@ -292,8 +293,13 @@ def find(model):
 #   4. mounted, it has an INFO_UF2.TXT that names an RP2 board
 #
 # Only then, and only one file, by name, inside a mountpoint this script made
-# itself. Two such drives attached is an error rather than a guess. Nothing is
-# ever deleted, and no other disk is read, mounted or touched.
+# itself. Two such drives attached is an error rather than a guess. Nothing on
+# the drive is deleted, and no other disk is read, mounted or touched.
+#
+# 'padtool nuke' writes one more image, and it is the destructive one: it
+# erases the board's own flash back to factory-blank. It runs the same gauntlet
+# for the same reason -- what makes that safe is being certain the thing on the
+# end of the cable is one of our boards and not somebody's USB stick.
 # ---------------------------------------------------------------------------
 
 RP2_VID, RP2_PID = 0x2e8a, 0x0003
@@ -301,6 +307,12 @@ RP2_LABEL = "RPI-RP2"
 UF2_MAGIC = (0x0A324655, 0x9E5D5157, 0x0AB16F30)    # start, start, end
 UF2_FAMILY_RP2040 = 0xE48BFF56
 FLASH_WAIT = 30.0                                   # seconds to come back
+
+# The nuke image erases all 2MB before it resets, and that is not quick. The
+# board is gone from USB the whole time it works, so this is a real wait and
+# not a formality.
+NUKE_FIRMWARE = "firmware/universal_flash_nuke.uf2"
+NUKE_WAIT = 120.0
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -416,7 +428,7 @@ def mount_drive(drive):
         raise FlashError("Cannot find sudo and mount -- mount "
                          f"{drive['device']} yourself, then run this again.")
     mnt = tempfile.mkdtemp(prefix="padtool-rp2-")
-    print(f"Mounting {drive['device']} -- sudo is needed to mount a USB drive.")
+    print(f"Mounting {drive['device']}")
     rc = subprocess.call([sudo, mount, "-t", "vfat", "-o",
                           f"uid={os.getuid()},gid={os.getgid()},"
                           "noexec,nosuid,nodev,flush",
@@ -611,6 +623,125 @@ def cmd_flash(key, as_json):
         return 1
     print(f"\033[32mOK\033[0m -- {model['name']} is up on "
           f"{found[0]['device']}. Run 'padtool {key}' to test it.")
+    return 0
+
+
+def wait_for_bootloader(serial=None, timeout=NUKE_WAIT, tick=None):
+    """Wait for a board to reset, finish erasing, and come back blank.
+
+    It has to go away before it can come back. Seeing it leave is what says
+    the image was taken and is running, so a drive that never disappears is
+    treated as a write that never landed -- this times out rather than
+    reporting a wipe it did not witness.
+
+    Matching is by boot ROM serial: that is the flash chip's unique ID, which
+    is a property of the die and survives having every page erased. A board
+    that reports no serial falls back to being the only one attached, which
+    is already a precondition of the command.
+
+    Returns (drive, went_away). A drive means success; went_away tells the
+    caller which way it failed.
+    """
+    t0, gone = time.monotonic(), False
+    while True:
+        hits = [d for d in bootloader_drives()
+                if not serial or d["serial"] == serial]
+        if not hits:
+            gone = True
+        elif gone:
+            return hits[0], True
+        left = timeout - (time.monotonic() - t0)
+        if left <= 0:
+            return None, gone
+        if tick:
+            tick(left, gone)
+        time.sleep(0.5)
+
+
+def cmd_nuke(as_json):
+    """Erase a board's flash back to factory-blank, and prove it came back.
+
+    Same drive checks as flashing, because it is the same operation: one file,
+    by name, into a mountpoint this script made, on a disk that has cleared
+    every test in bootloader_drives() and shown an INFO_UF2.TXT. The image is
+    what differs -- this one erases the whole chip instead of programming it.
+    """
+    def fail(msg):
+        if as_json:
+            print(json.dumps({"command": "nuke", "nuked": False,
+                              "error": msg}, indent=2))
+        else:
+            print(f"\033[31m{msg}\033[0m", file=sys.stderr)
+        return 1
+
+    fw = os.path.join(REPO, NUKE_FIRMWARE)
+    bad = check_uf2(fw)
+    if bad:
+        return fail(bad)
+
+    drives = bootloader_drives()
+    if not drives:
+        return fail(f"No {RP2_LABEL} drive found -- plug the board in holding "
+                    "BOOTSEL. A controller running firmware is not a "
+                    "bootloader drive and cannot be nuked; hold BOOTSEL while "
+                    "connecting it.")
+    if len(drives) > 1:
+        return fail("More than one bootloader drive is attached ("
+                    + ", ".join(d["device"] for d in drives)
+                    + ") -- unplug all but the board you are erasing.")
+    drive = drives[0]
+
+    out = sys.stderr if as_json else sys.stdout
+    print(f"\n\033[1mFlash nuke\033[0m -- board on {drive['device']} "
+          f"(boot ROM {drive['usb']}, SN {drive['serial'] or '?'})", file=out)
+    print(f"  firmware  {NUKE_FIRMWARE}  "
+          f"({os.path.getsize(fw) >> 10} KiB)", file=out)
+    print("  erasing   the whole flash -- firmware, settings, everything on "
+          "the board", file=out)
+
+    try:
+        mnt, ours = mount_drive(drive)
+        try:
+            print(f"  board     {confirm_bootloader(mnt)}", file=out)
+            written = write_firmware(mnt, fw, quiet=as_json)
+        finally:
+            if ours:
+                unmount_drive(mnt)
+    except FlashError as e:
+        return fail(str(e))
+
+    def tick(left, gone):
+        if as_json:
+            return
+        state = "erasing" if gone else "waiting for it to reset"
+        sys.stdout.write(f"\r  {state} -- {left:.0f}s left\033[K")
+        sys.stdout.flush()
+
+    back, went_away = wait_for_bootloader(drive["serial"] or None, tick=tick)
+    if not as_json:
+        sys.stdout.write("\r\033[K")
+
+    if not back:
+        still = bootloader_drives()
+        if not went_away:
+            return fail(f"{drive['device']} never left USB, so the nuke image "
+                        f"never ran. The board was not erased.")
+        extra = ("  Attached now: "
+                 + ", ".join(f"{d['device']} SN {d['serial'] or '?'}"
+                             for d in still)) if still else ""
+        return fail(f"The board did not come back as an {RP2_LABEL} drive "
+                    f"within {NUKE_WAIT:g}s.{extra}\nUnplug it and plug it "
+                    f"back in holding BOOTSEL, then run 'padtool list'.")
+
+    if as_json:
+        print(json.dumps({
+            "command": "nuke", "nuked": True,
+            "firmware": NUKE_FIRMWARE, "bytes": written,
+            "before": drive, "after": back,
+        }, indent=2))
+        return 0
+    print(f"\033[32mOK\033[0m -- board erased and back on {back['device']} "
+          f"(SN {back['serial'] or '?'})")
     return 0
 
 
@@ -926,26 +1057,32 @@ def cmd_test(key, node, as_json):
         sys.stdout.flush()
 
     render(time.monotonic())
-    finished = False
+    finished, gone = False, None
     try:
         with f:
             while True:
-                if select.select([f], [], [], 0.05)[0]:
-                    data = f.read(EV_SIZE)
-                    if data and len(data) == EV_SIZE:
-                        _, _, etype, code, value = struct.unpack(EV_FMT, data)
-                        # Inputs no check cares about are ignored, not counted:
-                        # the driver declares a whole standard layout whatever
-                        # the model actually has wired up.
-                        if etype == EV_KEY:
-                            if value == 1:
-                                held.add(code)
-                            elif value == 0:
-                                held.discard(code)
-                        elif etype == EV_ABS:
-                            vals[code] = value
-                            lo, hi = span.get(code, (value, value))
-                            span[code] = (min(lo, value), max(hi, value))
+                try:
+                    ready = select.select([f], [], [], 0.05)[0]
+                    data = f.read(EV_SIZE) if ready else None
+                except OSError as e:
+                    # Unplugged mid-test. The node stays open but the device
+                    # behind it is gone, and every read is ENODEV from here on.
+                    gone = e
+                    break
+                if data and len(data) == EV_SIZE:
+                    _, _, etype, code, value = struct.unpack(EV_FMT, data)
+                    # Inputs no check cares about are ignored, not counted:
+                    # the driver declares a whole standard layout whatever
+                    # the model actually has wired up.
+                    if etype == EV_KEY:
+                        if value == 1:
+                            held.add(code)
+                        elif value == 0:
+                            held.discard(code)
+                    elif etype == EV_ABS:
+                        vals[code] = value
+                        lo, hi = span.get(code, (value, value))
+                        span[code] = (min(lo, value), max(hi, value))
                 now = time.monotonic()
                 settle(now)
                 render(now)
@@ -954,16 +1091,21 @@ def cmd_test(key, node, as_json):
                     break
     except KeyboardInterrupt:
         pass
+    except OSError as e:            # closing a node whose device has gone
+        gone = gone or e
 
     if finished and not as_json:
         time.sleep(0.4)         # let the completed checklist land on screen
 
+    # A controller that leaves halfway through has not passed, whatever it had
+    # ticked off by then -- the rest of the checklist was never answered.
     missing = [sp["label"] for i, sp in enumerate(specs) if not ok(i)]
     if as_json:
         print(json.dumps({
             "model": key, "found": True, "device": pad,
             "flashed": flashed,
-            "pass": not missing,
+            "pass": not missing and not gone,
+            "disconnected": str(gone) if gone else None,
             "hold_seconds": HOLD_SECS,
             "verified": [sp["label"] for i, sp in enumerate(specs) if ok(i)],
             "missing": missing,
@@ -977,10 +1119,19 @@ def cmd_test(key, node, as_json):
         }, indent=2))
     else:
         print()
-        if missing:
+        if gone:
+            print(f"\033[31mDISCONNECTED\033[0m -- {pad['device']} went away "
+                  f"mid-test ({gone.strerror or gone}). "
+                  f"{total - len(missing)} of {total} inputs had passed.")
+            if missing:
+                print(f"Not verified: {', '.join(missing)}")
+            print(f"Plug it back in and run 'padtool {key}' again.")
+        elif missing:
             print(f"\033[31mFAIL\033[0m -- never held: {', '.join(missing)}")
         else:
             print(f"\033[32mPASS\033[0m -- all {total} inputs held steady.")
+    if gone:
+        return 1                    # aborted, as opposed to 2 for a real fail
     return 0 if not missing else 2
 
 
@@ -1018,26 +1169,30 @@ def cmd_probe(node, seconds):
     print("Every settled state is printed. Axes are shown only when they are "
           "away from rest.\n")
     t0 = last_ev = time.monotonic()
-    shown, dirty = None, False
+    shown, dirty, gone = None, False, None
     with f:
         while time.monotonic() - t0 < seconds:
-            if select.select([f], [], [], 0.05)[0]:
-                data = f.read(EV_SIZE)
-                if data and len(data) == EV_SIZE:
-                    _, _, etype, code, value = struct.unpack(EV_FMT, data)
-                    if etype == EV_KEY and code in BTN:
-                        if value == 1:
-                            held.add(code)
-                            if code not in order:
-                                order.append(code)
-                        elif value == 0:
-                            held.discard(code)
-                        last_ev, dirty = time.monotonic(), True
-                    elif etype == EV_ABS and code in ABS:
-                        cur[code] = value
-                        lo, hi = span.get(code, (value, value))
-                        span[code] = (min(lo, value), max(hi, value))
-                        last_ev, dirty = time.monotonic(), True
+            try:
+                ready = select.select([f], [], [], 0.05)[0]
+                data = f.read(EV_SIZE) if ready else None
+            except OSError as e:
+                gone = e            # unplugged -- keep what was seen so far
+                break
+            if data and len(data) == EV_SIZE:
+                _, _, etype, code, value = struct.unpack(EV_FMT, data)
+                if etype == EV_KEY and code in BTN:
+                    if value == 1:
+                        held.add(code)
+                        if code not in order:
+                            order.append(code)
+                    elif value == 0:
+                        held.discard(code)
+                    last_ev, dirty = time.monotonic(), True
+                elif etype == EV_ABS and code in ABS:
+                    cur[code] = value
+                    lo, hi = span.get(code, (value, value))
+                    span[code] = (min(lo, value), max(hi, value))
+                    last_ev, dirty = time.monotonic(), True
             now = time.monotonic()
             # Wait for things to stop moving before printing, so one flick of a
             # stick is a single line rather than fifty.
@@ -1052,6 +1207,12 @@ def cmd_probe(node, seconds):
                     print(f"  {now - t0:5.2f}s  {btxt:<34} {atxt}")
                 dirty = False
 
+    if gone:
+        # Whatever was seen before it left is still worth reading, so the
+        # summary is printed either way -- the exit code carries the failure.
+        print(f"\n\033[31m{pad['device']} went away mid-probe "
+              f"({gone.strerror or gone})\033[0m -- stopping "
+              f"{time.monotonic() - t0:.0f}s in.")
     print(f"\n\033[1mButtons seen\033[0m ({len(order)}), in the order pressed:")
     for c in order:
         print(f"  {c}  {BTN[c]}")
@@ -1068,7 +1229,7 @@ def cmd_probe(node, seconds):
         print(f"  {SHORT.get(c, c):<5} {ABS[c]:<16} rest {r:>7}  "
               f"seen {lo:>7}..{hi:<7}{tail}")
     print()
-    return 0
+    return 1 if gone else 0
 
 
 def main():
@@ -1084,6 +1245,8 @@ def main():
                   + ", ".join(MODELS) + ")", file=sys.stderr)
             return 1
         return cmd_flash(args[1], as_json)
+    if cmd == "nuke":
+        return cmd_nuke(as_json)
     if cmd == "models":
         return cmd_models()
     if cmd == "list":
