@@ -4,6 +4,7 @@
 padtool - verify every input on a Granola controller.
 
   padtool <model> [event#]   find that model and test its inputs (--json ok)
+  padtool flash <model>      write that model's firmware to a blank board
   padtool models             list the models this script knows about
   padtool list               dump every connected pad's raw attributes
   padtool probe [event#] [s] watch a pad live -- how a new profile is built
@@ -13,9 +14,15 @@ off-the-shelf pads, so the script cannot tell one of ours from another.
 You say what you plugged in; the script checks something matching it is
 there and refuses to run if it is not.
 
+A board that has never been flashed is not a pad at all -- it comes up as
+an RPI-RP2 USB drive. 'padtool <model>' notices that, writes that model's
+firmware, waits for the board to reboot as a controller, and carries on
+into the tester, so a blank board and a finished one are the same command.
+
 Reads evdev directly. Python stdlib only, no evdev/SDL bindings.
 """
 import sys, os, re, time, glob, json, struct, select, fcntl
+import subprocess, tempfile
 
 # struct input_event on 64-bit: time_sec, time_usec, type, code, value
 EV_FMT = "llHHi"
@@ -25,15 +32,15 @@ EV_SYN, EV_KEY, EV_ABS = 0x00, 0x01, 0x03
 BTN = {
     304: "A",             305: "B",             306: "C",
     307: "X",             308: "Y",             309: "Z",
-    310: "L1 / LB",       311: "R1 / RB",       312: "L2 (digital)",
-    313: "R2 (digital)",  314: "Select / Back", 315: "Start",
-    316: "Guide / Home",  317: "L3 (stick)",    318: "R3 (stick)",
+    310: "L1",            311: "R1",            312: "L2 (digital)",
+    313: "R2 (digital)",  314: "Select",        315: "Start",
+    316: "Home",          317: "L3",            318: "R3",
     544: "D-pad Up",      545: "D-pad Down",    546: "D-pad Left",
     547: "D-pad Right",
 }
 ABS = {
-    0: "Left stick X",  1: "Left stick Y",  2: "L2 trigger",
-    3: "Right stick X", 4: "Right stick Y", 5: "R2 trigger",
+    0: "Left stick X",  1: "Left stick Y",  2: "L2",
+    3: "Right stick X", 4: "Right stick Y", 5: "R2",
     16: "D-pad X (hat)", 17: "D-pad Y (hat)",
 }
 
@@ -47,6 +54,8 @@ SHORT = {0: "LX", 1: "LY", 2: "L2", 3: "RX", 4: "RY", 5: "R2",
 # thing an operator does to the controller, and one line on the checklist:
 #
 #   button(code)              a digital button, held down
+#   stop(code, end, label)    an axis held at ONE of its stops, min or max
+#   press(code)               a trigger: stop() at max, named for the axis
 #   sweep(code)               an axis pushed to BOTH of its declared stops
 #   at(code, value, label)    an axis parked on one specific value
 #
@@ -58,6 +67,11 @@ SHORT = {0: "LX", 1: "LY", 2: "L2", 3: "RX", 4: "RY", 5: "R2",
 # Every number below was measured off a known-good controller with
 # `padtool probe`. None of it is derived from firmware or guessed.
 #
+#   firmware     the image a blank board of this model gets flashed with,
+#                relative to the repo root. Naming the model on the command
+#                line is what picks it: a board in bootloader mode says
+#                nothing about which of our controllers it is going to be.
+#
 #   presents_as  what the pad claims to be over USB. Ours run stock firmware
 #                personalities, so this is not unique to us -- a genuine pad
 #                of the same kind would also match. That is fine: it only has
@@ -66,6 +80,28 @@ SHORT = {0: "LX", 1: "LY", 2: "L2", 3: "RX", 4: "RY", 5: "R2",
 
 def button(code, label=None):
     return {"kind": "button", "code": code, "label": label or BTN[code]}
+
+
+def stop(code, end, label=None):
+    """One end of an axis, checked and displayed as an ordinary button.
+
+    An operator does not push "Left stick X", they push Left and then Right,
+    and each is its own thing that can be broken on its own. Splitting the
+    axis gives each direction its own line, its own tick, and its own name.
+    """
+    return {"kind": "stop", "code": code, "end": end,
+            "label": label or f"{ABS[code]} {end}"}
+
+
+def press(code, label=None):
+    """A trigger with no travel: a stop() check by another name.
+
+    The Beacon's triggers report 0 released and 255 held, with nothing in
+    between. sweep() would count the resting 0 as one of the two stops it
+    wants, leaving the check permanently half-verified and permanently
+    marked active, so only the pulled end is worth watching.
+    """
+    return stop(code, "max", label or ABS[code])
 
 
 def sweep(code, label=None):
@@ -82,15 +118,31 @@ MODELS = {
         "name": "Granola Beacon",
         "presents_as": "wired Xbox 360 pad (XInput)",
         "vid": 0x045e, "pid": 0x028e,
+        "firmware": "firmware/GP2040-CE_0.7.12_GranolaBeacon.uf2",
         # No right stick (ABS 3/4) and no d-pad (hat ABS 16/17) on this model.
-        "inputs": [button(c) for c in (304, 305, 307, 308, 310, 311,
-                                       314, 315, 316, 317, 318)]
-                  + [sweep(c) for c in (0, 1, 2, 5)],
+        # Listed in the order an operator works around the pad, not in evdev
+        # code order: stick, face, shoulders and sticks-in, then the middle.
+        "inputs": [
+            # One input per direction. evdev's Y axis grows downward, so min
+            # is Up and max is Down.
+            stop(0, "min", "Left"), stop(0, "max", "Right"),
+            stop(1, "min", "Up"),   stop(1, "max", "Down"),
+
+            button(304), button(305), button(307), button(308),
+
+            # L2/R2 come through as axes, but the hardware behind them is a
+            # plain switch: 0 released, 255 held.
+            button(310), button(311), press(2), press(5),
+            button(317), button(318),
+
+            button(314), button(315), button(316),
+        ],
     },
     "plateau": {
         "name": "Granola Plateau",
         "presents_as": "wired Xbox 360 pad (XInput, Mad Catz ID)",
         "vid": 0x0738, "pid": 0x4726,
+        "firmware": "firmware/Haybox-GRAM-v1.0.uf2",
         "inputs": [
             button(304), button(305), button(307), button(308),
             button(311, "Z"), button(315),
@@ -130,9 +182,17 @@ MODELS = {
 
 
 def req_codes(model):
-    """The evdev codes a model's checks need the device to offer."""
-    return ([c["code"] for c in model["inputs"] if c["kind"] == "button"],
-            [c["code"] for c in model["inputs"] if c["kind"] != "button"])
+    """The evdev codes a model's checks need the device to offer.
+
+    Deduplicated: one axis can carry several checks -- Left and Right are two
+    inputs on one code -- but it is still one thing to ask the driver about.
+    """
+    def codes(want_button):
+        seen = {c["code"]: None for c in model["inputs"]
+                if (c["kind"] == "button") == want_button}
+        return list(seen)
+
+    return codes(True), codes(False)
 
 
 def _read(path, default=""):
@@ -215,6 +275,345 @@ def find(model):
     return [p for p in gamepads() if matches(p, model)]
 
 
+# ---------------------------------------------------------------------------
+# Blank boards.
+#
+# A controller that has never been flashed is not a gamepad: the RP2040 sits
+# in its boot ROM and appears as a 128MB USB drive labelled RPI-RP2, whose
+# filesystem is a fiction. A .uf2 copied there is not stored, it is decoded
+# and burned into flash, and the board reboots as the controller.
+#
+# Writing to the wrong disk would destroy somebody's data, so a drive has to
+# clear every one of these before this script writes a byte to it:
+#
+#   1. USB VID:PID is 2e8a:0003 -- Raspberry Pi's boot ROM, nothing else
+#   2. the SCSI vendor/model strings are RPI / RP2
+#   3. the partition is FAT labelled RPI-RP2
+#   4. mounted, it has an INFO_UF2.TXT that names an RP2 board
+#
+# Only then, and only one file, by name, inside a mountpoint this script made
+# itself. Two such drives attached is an error rather than a guess. Nothing is
+# ever deleted, and no other disk is read, mounted or touched.
+# ---------------------------------------------------------------------------
+
+RP2_VID, RP2_PID = 0x2e8a, 0x0003
+RP2_LABEL = "RPI-RP2"
+UF2_MAGIC = (0x0A324655, 0x9E5D5157, 0x0AB16F30)    # start, start, end
+UF2_FAMILY_RP2040 = 0xE48BFF56
+FLASH_WAIT = 30.0                                   # seconds to come back
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+class FlashError(Exception):
+    """Something is wrong -- say so and write nothing."""
+
+
+def _udev(sysfs):
+    """udev's recorded properties for a block device, {} if unreadable.
+
+    Reading udev's scan is better than doing our own: the label is had
+    without this script opening a disk it may have no business opening.
+    """
+    props = {}
+    try:
+        with open("/run/udev/data/b" + _read(os.path.join(sysfs, "dev"))) as f:
+            for line in f:
+                if line.startswith("E:") and "=" in line:
+                    k, v = line[2:].strip().split("=", 1)
+                    props[k] = v
+    except OSError:
+        pass
+    return props
+
+
+def bootloader_drives():
+    """Every attached RP2 board sitting in its boot ROM, waiting for firmware."""
+    out = []
+    for disk in sorted(glob.glob("/sys/block/sd*")):
+        if _read(f"{disk}/removable") != "1":
+            continue
+        if (_read(f"{disk}/device/vendor"),
+                _read(f"{disk}/device/model")) != ("RPI", "RP2"):
+            continue
+        # Walk up to the USB device and check it really is the boot ROM.
+        usb, cur = None, os.path.realpath(f"{disk}/device")
+        for _ in range(8):
+            cur = os.path.dirname(cur)
+            if os.path.exists(os.path.join(cur, "idVendor")):
+                usb = cur
+                break
+        if not usb:
+            continue
+        if (int(_read(f"{usb}/idVendor", "0") or "0", 16),
+                int(_read(f"{usb}/idProduct", "0") or "0", 16)) != (RP2_VID, RP2_PID):
+            continue
+        name = os.path.basename(disk)
+        for part in sorted(glob.glob(f"{disk}/{name}[0-9]*")):
+            node = "/dev/" + os.path.basename(part)
+            props = _udev(part)
+            label, fstype = props.get("ID_FS_LABEL"), props.get("ID_FS_TYPE")
+            if label is None:       # no udev db to read -- use the by-label link
+                if os.path.realpath(f"/dev/disk/by-label/{RP2_LABEL}") == node:
+                    label, fstype = RP2_LABEL, "vfat"
+            if (label, fstype) != (RP2_LABEL, "vfat"):
+                continue
+            out.append({
+                "device": node,
+                "disk": "/dev/" + name,
+                "usb": f"{RP2_VID:04x}:{RP2_PID:04x}",
+                "product": _read(f"{usb}/product"),
+                "serial": _read(f"{usb}/serial"),
+            })
+    return out
+
+
+def _tool(name):
+    """Absolute path to a system binary. PATH is not ours to trust: this
+    script runs under a pure nix-shell, where PATH holds python and nothing
+    else, and sudo would rewrite it anyway."""
+    for d in ("/run/wrappers/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+              "/run/current-system/sw/bin"):
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+_OCTAL = re.compile(r"\\([0-7]{3})")
+
+
+def mountpoint_of(node):
+    """Where the kernel says this device is mounted right now, or None."""
+    try:
+        st = os.stat(node)
+    except OSError:
+        return None
+    want = f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                fields = line.split()
+                if len(fields) > 4 and fields[2] == want:
+                    return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), fields[4])
+    except OSError:
+        pass
+    return None
+
+
+def mount_drive(drive):
+    """Mount the bootloader drive. Returns (mountpoint, we_mounted_it).
+
+    Mounting a USB disk needs root, so this is the one place the script asks
+    for sudo. If something else (an automounter) already has it mounted, that
+    mountpoint is used as it stands and left alone afterwards.
+    """
+    already = mountpoint_of(drive["device"])
+    if already:
+        return already, False
+    sudo, mount = _tool("sudo"), _tool("mount")
+    if not (sudo and mount):
+        raise FlashError("Cannot find sudo and mount -- mount "
+                         f"{drive['device']} yourself, then run this again.")
+    mnt = tempfile.mkdtemp(prefix="padtool-rp2-")
+    print(f"Mounting {drive['device']} -- sudo is needed to mount a USB drive.")
+    rc = subprocess.call([sudo, mount, "-t", "vfat", "-o",
+                          f"uid={os.getuid()},gid={os.getgid()},"
+                          "noexec,nosuid,nodev,flush",
+                          drive["device"], mnt])
+    if rc != 0:
+        os.rmdir(mnt)
+        raise FlashError(f"Could not mount {drive['device']}.")
+    # Believe the kernel rather than our own command line: it has to be that
+    # device, on that directory, or nothing gets written.
+    if mountpoint_of(drive["device"]) != mnt:
+        raise FlashError(f"{drive['device']} is not mounted on {mnt} -- "
+                         "refusing to write.")
+    return mnt, True
+
+
+def unmount_drive(mnt):
+    """Best effort. The board resets mid-write, so this usually fails, and a
+    failure here says nothing about whether the flash worked."""
+    sudo, umount = _tool("sudo"), _tool("umount")
+    if sudo and umount:
+        # Timed, because the device is already gone: a plain umount can sit
+        # waiting on a disk that will never answer, and the operator is
+        # waiting on the tester. Lazy unmount is the fallback.
+        for extra in ([], ["-l"]):
+            try:
+                if subprocess.run([sudo, umount] + extra + [mnt],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=10).returncode == 0:
+                    break
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+    try:
+        os.rmdir(mnt)
+    except OSError:
+        pass
+
+
+def check_uf2(path):
+    """Reject anything that is not an RP2040 UF2, before it reaches a board.
+
+    A UF2 is a whole number of 512-byte blocks, each stamped front and back
+    with its own magic, and each carrying the family of chip it was built
+    for. Checking costs nothing and beats burning junk into a controller.
+    """
+    if not os.path.isfile(path):
+        return f"Firmware file not found: {path}"
+    size = os.path.getsize(path)
+    if size == 0 or size % 512:
+        return f"{path} is not a whole number of 512-byte UF2 blocks."
+    with open(path, "rb") as f:
+        head = f.read(512)
+    magic = struct.unpack("<II", head[:8]) + struct.unpack("<I", head[508:512])
+    if magic != UF2_MAGIC:
+        return f"{path} is not a UF2 image."
+    flags, family = struct.unpack("<I", head[8:12])[0], struct.unpack("<I", head[28:32])[0]
+    if flags & 0x2000 and family != UF2_FAMILY_RP2040:
+        return (f"{path} was built for chip family 0x{family:08x}, not the "
+                f"RP2040 (0x{UF2_FAMILY_RP2040:08x}).")
+    return None
+
+
+def confirm_bootloader(mnt):
+    """The last gate, and the only one that looks at the filesystem itself.
+
+    Every RP2 boot ROM presents an INFO_UF2.TXT naming the board. A disk
+    without one is somebody's data, not a controller.
+    """
+    info = os.path.join(mnt, "INFO_UF2.TXT")
+    if not os.path.isfile(info):
+        raise FlashError(f"{mnt} has no INFO_UF2.TXT -- that is not a "
+                         "bootloader drive. Nothing was written.")
+    text = _read(info)
+    if "RP2" not in text.upper():
+        raise FlashError(f"{mnt} does not identify itself as an RP2 board:\n"
+                         f"{text}\nNothing was written.")
+    return " / ".join(ln.strip() for ln in text.splitlines() if ln.strip())
+
+
+def write_firmware(mnt, fw, quiet=False):
+    """Copy one file, by name, into the mountpoint we just made.
+
+    The board resets the instant the last block lands, so an error at the end
+    of the write is the happy path and not a failure; an error before that is.
+    """
+    dst = os.path.join(mnt, os.path.basename(fw))
+    if os.path.dirname(os.path.realpath(dst)) != os.path.realpath(mnt):
+        raise FlashError(f"Refusing to write outside {mnt}.")
+    total, done = os.path.getsize(fw), 0
+    try:
+        with open(fw, "rb") as src, open(dst, "wb") as out:
+            while True:
+                chunk = src.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if not quiet:
+                    sys.stdout.write(f"\r  writing  {done * 100 // total:3d}%  "
+                                     f"{done >> 10}/{total >> 10} KiB")
+                    sys.stdout.flush()
+            out.flush()
+            os.fsync(out.fileno())
+    except OSError as e:
+        if done < total:
+            raise FlashError(f"Write failed after {done} of {total} bytes: {e}")
+    if not quiet:
+        sys.stdout.write(f"\r  writing  100%  {total >> 10} KiB\033[K\n")
+    return done
+
+
+def do_flash(key, as_json=False):
+    """Flash this model's firmware onto the one blank board attached."""
+    model = MODELS[key]
+    fw = os.path.join(REPO, model["firmware"])
+    bad = check_uf2(fw)
+    if bad:
+        raise FlashError(bad)
+
+    drives = bootloader_drives()
+    if not drives:
+        raise FlashError(f"No {RP2_LABEL} drive found -- plug the board in "
+                         "holding BOOTSEL, or check the cable.")
+    if len(drives) > 1:
+        raise FlashError("More than one bootloader drive is attached ("
+                         + ", ".join(d["device"] for d in drives)
+                         + ") -- unplug all but the board you are flashing.")
+    drive = drives[0]
+
+    out = sys.stderr if as_json else sys.stdout
+    print(f"\n\033[1m{model['name']}\033[0m -- blank board on "
+          f"{drive['device']} (boot ROM {drive['usb']}, "
+          f"SN {drive['serial'] or '?'})", file=out)
+    print(f"  firmware  {model['firmware']}  "
+          f"({os.path.getsize(fw) >> 10} KiB)", file=out)
+
+    mnt, ours = mount_drive(drive)
+    try:
+        print(f"  board     {confirm_bootloader(mnt)}", file=out)
+        written = write_firmware(mnt, fw, quiet=as_json)
+    finally:
+        if ours:
+            unmount_drive(mnt)
+    print(f"Flashed. Waiting up to {FLASH_WAIT:g}s for it to reboot as a "
+          "controller...", file=out)
+    return {"device": drive["device"], "serial": drive["serial"],
+            "firmware": model["firmware"], "bytes": written}
+
+
+def wait_for_pad(model, timeout=FLASH_WAIT):
+    """Poll until the freshly flashed board enumerates as its model.
+
+    Re-enumeration and udev setting permissions do not happen at the same
+    instant, so a pad that is found but not yet readable gets a few seconds
+    of grace before we hand it back anyway and let the caller complain.
+    """
+    t0, seen, since = time.monotonic(), [], None
+    while time.monotonic() - t0 < timeout:
+        found = find(model)
+        if found:
+            seen = found
+            if since is None:
+                since = time.monotonic()
+            if found[0]["readable"] or time.monotonic() - since > 5:
+                return found
+        time.sleep(0.25)
+    return seen
+
+
+def cmd_flash(key, as_json):
+    """Flash a blank board and stop there, without running the tester."""
+    model = MODELS[key]
+    try:
+        info = do_flash(key, as_json)
+    except FlashError as e:
+        if as_json:
+            print(json.dumps({"model": key, "flashed": False,
+                              "error": str(e)}, indent=2))
+        else:
+            print(f"\033[31m{e}\033[0m", file=sys.stderr)
+        return 1
+    found = wait_for_pad(model)
+    if as_json:
+        print(json.dumps({"model": key, "flashed": info,
+                          "came_back": bool(found),
+                          "device": found[0] if found else None}, indent=2))
+        return 0 if found else 1
+    if not found:
+        print(f"\033[31mFirmware written, but no {model['name']} appeared "
+              f"within {FLASH_WAIT:g}s\033[0m -- unplug the board and plug it "
+              "back in.", file=sys.stderr)
+        return 1
+    print(f"\033[32mOK\033[0m -- {model['name']} is up on "
+          f"{found[0]['device']}. Run 'padtool {key}' to test it.")
+    return 0
+
+
 # EVIOCGABS(code) = _IOR('E', 0x40 + code, sizeof(struct input_absinfo))
 # struct input_absinfo { __s32 value, minimum, maximum, fuzz, flat, resolution; }
 ABSINFO_FMT = "=6i"
@@ -252,9 +651,18 @@ def absinfo(fd, codes):
 def cmd_models():
     for key, m in MODELS.items():
         total = len(m["inputs"])
+        fw = os.path.join(REPO, m["firmware"])
+        size = (f"{os.path.getsize(fw) >> 10} KiB" if os.path.isfile(fw)
+                else "\033[31mMISSING\033[0m")
         print(f"  \033[1m{key:<10}\033[0m {m['name']}  --  {total} inputs, "
               f"presents as {m['presents_as']}")
+        print(f"             firmware: {m['firmware']} ({size})")
         print(f"             found: {len(find(m))} connected")
+    blank = bootloader_drives()
+    if blank:
+        print(f"\n  {len(blank)} blank board(s) in bootloader mode: "
+              + ", ".join(d["device"] for d in blank))
+        print("  'padtool <model>' will flash one and then test it.")
     return 0
 
 
@@ -263,11 +671,14 @@ def cmd_list(as_json):
     pads = gamepads()
     for p in pads:
         p["matches"] = [k for k, m in MODELS.items() if matches(p, m)]
+    # Blank boards are listed too: they are the other thing that can be on the
+    # end of the cable, and they are invisible to everything above.
+    blank = bootloader_drives()
     if as_json:
-        print(json.dumps(pads, indent=2))
-        return 0 if pads else 1
-    if not pads:
-        print("No gamepads found.")
+        print(json.dumps({"pads": pads, "bootloader_drives": blank}, indent=2))
+        return 0 if pads or blank else 1
+    if not pads and not blank:
+        print("No gamepads and no bootloader drives found.")
         return 1
     for p in pads:
         hits = p["matches"]
@@ -284,6 +695,13 @@ def cmd_list(as_json):
         print(f"  matches model : {', '.join(hits) if hits else 'none'}")
         if not p["readable"]:
             print("  \033[33m! not readable by you -- add yourself to the 'input' group\033[0m")
+    for d in blank:
+        print(f"\n\033[1mRP2 bootloader drive\033[0m  ({d['device']})")
+        print(f"  USB ID        : {d['usb']}"
+              + (f"  ({d['product']})" if d["product"] else ""))
+        if d["serial"]:
+            print(f"  serial        : {d['serial']}")
+        print("  state         : blank board -- 'padtool <model>' flashes it")
     print()
     return 0
 
@@ -314,6 +732,18 @@ def check_token(spec, held, vals, declared, rest):
     if spec["kind"] == "at":
         return "at" if abs(v - spec["value"]) <= spec["tol"] else None
     rng = declared.get(spec["code"])
+    if spec["kind"] == "stop":
+        # Only the named end counts. The other one is somebody else's check,
+        # or -- for a trigger -- where the axis sits when nothing is happening.
+        want_max = spec["end"] == "max"
+        if not rng:                 # no declared range: which way did it go?
+            r = rest.get(spec["code"])
+            if r is None:
+                return None
+            return "down" if (v > r if want_max else v < r) else None
+        lo, hi = rng
+        tol = (hi - lo) * AXIS_TOL
+        return "down" if (v >= hi - tol if want_max else v <= lo + tol) else None
     if not rng:                     # driver declared no usable range
         return "moved" if v != rest.get(spec["code"]) else None
     lo, hi = rng
@@ -327,7 +757,7 @@ def check_token(spec, held, vals, declared, rest):
 
 def check_needs(spec, declared):
     """Every token a check must collect before it counts as verified."""
-    if spec["kind"] == "button":
+    if spec["kind"] in ("button", "stop"):
         return {"down"}
     if spec["kind"] == "at":
         return {"at"}
@@ -336,23 +766,45 @@ def check_needs(spec, declared):
 
 def cmd_test(key, node, as_json):
     model = MODELS[key]
-    found = find(model)
-    if node:
-        # An explicit node still has to look like the model -- naming it picks
-        # which pad to test, it does not waive the check.
-        found = [p for p in found if node in (p["event"], p["device"])]
-        msg = f"{node} is not a {model['name']} -- expected a {model['presents_as']}."
-    else:
-        msg = f"No {model['name']} found -- expected a {model['presents_as']}."
-    if not found:
+
+    def fail(msg, hint=None):
         if as_json:
             print(json.dumps({"model": key, "found": False, "pass": False,
                               "error": msg}, indent=2))
         else:
             print(f"\033[31m{msg}\033[0m", file=sys.stderr)
-            print("Plug one in, or run 'padtool list' to see what is attached.",
-                  file=sys.stderr)
+            if hint:
+                print(hint, file=sys.stderr)
         return 1
+
+    found, flashed = find(model), None
+    if node:
+        # An explicit node still has to look like the model -- naming it picks
+        # which pad to test, it does not waive the check. It also opts out of
+        # flashing: a node is an evdev device, and a blank board has none.
+        found = [p for p in found if node in (p["event"], p["device"])]
+        if not found:
+            return fail(f"{node} is not a {model['name']} -- expected a "
+                        f"{model['presents_as']}.",
+                        "Run 'padtool list' to see what is attached.")
+    elif not found:
+        # Nothing matching is plugged in -- but a board with no firmware is
+        # not a pad at all, so before giving up, look for one to flash.
+        if not bootloader_drives():
+            return fail(f"No {model['name']} found -- expected a "
+                        f"{model['presents_as']}, or a blank board as an "
+                        f"{RP2_LABEL} drive.",
+                        "Plug one in, or run 'padtool list' to see what is "
+                        "attached.")
+        try:
+            flashed = do_flash(key, as_json)
+        except FlashError as e:
+            return fail(str(e))
+        found = wait_for_pad(model)
+        if not found:
+            return fail(f"Firmware written, but no {model['name']} appeared "
+                        f"within {FLASH_WAIT:g}s -- unplug the board and plug "
+                        f"it back in, then run 'padtool {key}' again.")
     pad = found[0]
 
     specs = model["inputs"]
@@ -377,6 +829,9 @@ def cmd_test(key, node, as_json):
 
     if not as_json:
         extra = f"  (+{len(found) - 1} more connected)" if len(found) > 1 else ""
+        if flashed:
+            print(f"\033[32mFlashed\033[0m {flashed['firmware']} -- now "
+                  "checking the hardware.")
         print(f"\n\033[1m{model['name']}\033[0m -- {pad['device']}{extra}")
         print(f"Hold each input for {HOLD_SECS:g}s. Anything naming a modifier "
               f"means hold the modifier and the input together.")
@@ -424,7 +879,7 @@ def cmd_test(key, node, as_json):
     def detail_for(i):
         """The middle column: what the check is watching right now."""
         sp = specs[i]
-        if sp["kind"] == "button":
+        if sp["kind"] in ("button", "stop"):
             return "", ""
         v = vals.get(sp["code"])
         if sp["kind"] == "at":
@@ -507,6 +962,7 @@ def cmd_test(key, node, as_json):
     if as_json:
         print(json.dumps({
             "model": key, "found": True, "device": pad,
+            "flashed": flashed,
             "pass": not missing,
             "hold_seconds": HOLD_SECS,
             "verified": [sp["label"] for i, sp in enumerate(specs) if ok(i)],
@@ -515,6 +971,7 @@ def cmd_test(key, node, as_json):
                 "label": sp["label"], "kind": sp["kind"], "code": sp["code"],
                 "ok": ok(i), "needs": sorted(needs[i]), "held": sorted(got[i]),
                 "target": sp.get("value"), "tol": sp.get("tol"),
+                "end": sp.get("end"),
                 "observed": list(span[sp["code"]]) if sp["code"] in span else None,
             } for i, sp in enumerate(specs)],
         }, indent=2))
@@ -621,6 +1078,12 @@ def main():
     cmd = args[0] if args else ""
     if cmd in MODELS:
         return cmd_test(cmd, args[1] if len(args) > 1 else None, as_json)
+    if cmd == "flash":
+        if len(args) < 2 or args[1] not in MODELS:
+            print("Usage: padtool flash <model>   (models: "
+                  + ", ".join(MODELS) + ")", file=sys.stderr)
+            return 1
+        return cmd_flash(args[1], as_json)
     if cmd == "models":
         return cmd_models()
     if cmd == "list":
