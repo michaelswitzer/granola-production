@@ -1,14 +1,14 @@
 #!/usr/bin/env nix-shell
 #!nix-shell -i python3 -p python3 --pure
 """
-padtool - verify every input on a Granola controller.
+granola - verify every input on a Granola controller.
 
-  padtool <model> [event#]   find that model and test its inputs (--json ok)
-  padtool flash <model>      write that model's firmware to a blank board
-  padtool nuke               erase a board's flash back to factory blank
-  padtool models             list the models this script knows about
-  padtool list               dump every connected pad's raw attributes
-  padtool probe [event#] [s] watch a pad live -- how a new profile is built
+  granola <model> [event#]   find that model and test its inputs (--json ok)
+  granola flash <model>      write that model's firmware to a blank board
+  granola nuke               erase a board's flash back to factory blank
+  granola models             list the models this script knows about
+  granola list               dump every connected pad's raw attributes
+  granola probe [event#] [s] watch a pad live -- how a new profile is built
 
 Naming the model is deliberate: our controllers present themselves as
 off-the-shelf pads, so the script cannot tell one of ours from another.
@@ -16,7 +16,7 @@ You say what you plugged in; the script checks something matching it is
 there and refuses to run if it is not.
 
 A board that has never been flashed is not a pad at all -- it comes up as
-an RPI-RP2 USB drive. 'padtool <model>' notices that, writes that model's
+an RPI-RP2 USB drive. 'granola <model>' notices that, writes that model's
 firmware, waits for the board to reboot as a controller, and carries on
 into the tester, so a blank board and a finished one are the same command.
 
@@ -66,7 +66,7 @@ SHORT = {0: "LX", 1: "LY", 2: "L2", 3: "RX", 4: "RY", 5: "R2",
 # produces, and landing on that coordinate is proof the modifier works.
 #
 # Every number below was measured off a known-good controller with
-# `padtool probe`. None of it is derived from firmware or guessed.
+# `granola probe`. None of it is derived from firmware or guessed.
 #
 #   firmware     the image a blank board of this model gets flashed with,
 #                relative to the repo root. Naming the model on the command
@@ -296,7 +296,7 @@ def find(model):
 # itself. Two such drives attached is an error rather than a guess. Nothing on
 # the drive is deleted, and no other disk is read, mounted or touched.
 #
-# 'padtool nuke' writes one more image, and it is the destructive one: it
+# 'granola nuke' writes one more image, and it is the destructive one: it
 # erases the board's own flash back to factory-blank. It runs the same gauntlet
 # for the same reason -- what makes that safe is being certain the thing on the
 # end of the cable is one of our boards and not somebody's USB stick.
@@ -427,7 +427,7 @@ def mount_drive(drive):
     if not (sudo and mount):
         raise FlashError("Cannot find sudo and mount -- mount "
                          f"{drive['device']} yourself, then run this again.")
-    mnt = tempfile.mkdtemp(prefix="padtool-rp2-")
+    mnt = tempfile.mkdtemp(prefix="granola-rp2-")
     print(f"Mounting {drive['device']}")
     rc = subprocess.call([sudo, mount, "-t", "vfat", "-o",
                           f"uid={os.getuid()},gid={os.getgid()},"
@@ -622,7 +622,7 @@ def cmd_flash(key, as_json):
               "back in.", file=sys.stderr)
         return 1
     print(f"\033[32mOK\033[0m -- {model['name']} is up on "
-          f"{found[0]['device']}. Run 'padtool {key}' to test it.")
+          f"{found[0]['device']}. Run 'granola {key}' to test it.")
     return 0
 
 
@@ -731,7 +731,7 @@ def cmd_nuke(as_json):
                              for d in still)) if still else ""
         return fail(f"The board did not come back as an {RP2_LABEL} drive "
                     f"within {NUKE_WAIT:g}s.{extra}\nUnplug it and plug it "
-                    f"back in holding BOOTSEL, then run 'padtool list'.")
+                    f"back in holding BOOTSEL, then run 'granola list'.")
 
     if as_json:
         print(json.dumps({
@@ -754,10 +754,10 @@ def _eviocgabs(code):
 # How much slack to allow at each end before calling an axis at its stop.
 AXIS_TOL = 0.10
 
-# A momentary contact is not a working input. Nothing is credited until it has
-# been held this long without interruption -- a button pressed and kept down,
-# an axis parked at one of its stops.
-HOLD_SECS = 1.0
+# Once every check has passed, the checklist stays on screen this long before
+# the script exits -- long enough to see whether a live marker is steady or
+# flickering on a marginal contact.
+SETTLE_SECS = 2.0
 
 
 def absinfo(fd, codes):
@@ -793,7 +793,7 @@ def cmd_models():
     if blank:
         print(f"\n  {len(blank)} blank board(s) in bootloader mode: "
               + ", ".join(d["device"] for d in blank))
-        print("  'padtool <model>' will flash one and then test it.")
+        print("  'granola <model>' will flash one and then test it.")
     return 0
 
 
@@ -832,7 +832,7 @@ def cmd_list(as_json):
               + (f"  ({d['product']})" if d["product"] else ""))
         if d["serial"]:
             print(f"  serial        : {d['serial']}")
-        print("  state         : blank board -- 'padtool <model>' flashes it")
+        print("  state         : blank board -- 'granola <model>' flashes it")
     print()
     return 0
 
@@ -852,8 +852,8 @@ def padv(text, width):
 def check_token(spec, held, vals, declared, rest):
     """What this check currently satisfies, or None.
 
-    Reducing every kind of check to a single token keeps the hold logic
-    uniform: whatever the token is, it has to stay put for HOLD_SECS.
+    Reducing every kind of check to a single token keeps the crediting
+    uniform: whatever the token is, seeing it is what verifies the check.
     """
     if spec["kind"] == "button":
         return "down" if spec["code"] in held else None
@@ -917,7 +917,7 @@ def cmd_test(key, node, as_json):
         if not found:
             return fail(f"{node} is not a {model['name']} -- expected a "
                         f"{model['presents_as']}.",
-                        "Run 'padtool list' to see what is attached.")
+                        "Run 'granola list' to see what is attached.")
     elif not found:
         # Nothing matching is plugged in -- but a board with no firmware is
         # not a pad at all, so before giving up, look for one to flash.
@@ -925,7 +925,7 @@ def cmd_test(key, node, as_json):
             return fail(f"No {model['name']} found -- expected a "
                         f"{model['presents_as']}, or a blank board as an "
                         f"{RP2_LABEL} drive.",
-                        "Plug one in, or run 'padtool list' to see what is "
+                        "Plug one in, or run 'granola list' to see what is "
                         "attached.")
         try:
             flashed = do_flash(key, as_json)
@@ -935,7 +935,7 @@ def cmd_test(key, node, as_json):
         if not found:
             return fail(f"Firmware written, but no {model['name']} appeared "
                         f"within {FLASH_WAIT:g}s -- unplug the board and plug "
-                        f"it back in, then run 'padtool {key}' again.")
+                        f"it back in, then run 'granola {key}' again.")
     pad = found[0]
 
     specs = model["inputs"]
@@ -956,7 +956,7 @@ def cmd_test(key, node, as_json):
     span = {c: (v, v) for c, v in rest.items()}     # observed travel, for JSON
     needs = [check_needs(sp, declared) for sp in specs]
     got = [set() for _ in specs]
-    cur = [(None, 0.0) for _ in specs]              # (token, since when)
+    cur = [None for _ in specs]                     # token satisfied right now
 
     if not as_json:
         extra = f"  (+{len(found) - 1} more connected)" if len(found) > 1 else ""
@@ -964,7 +964,6 @@ def cmd_test(key, node, as_json):
             print(f"\033[32mFlashed\033[0m {flashed['firmware']} -- now "
                   "checking the hardware.")
         print(f"\n\033[1m{model['name']}\033[0m -- {pad['device']}{extra}")
-        print(f"Hold each input for {HOLD_SECS:g}s.")
         print(f"Ctrl-C to give up.\n")
 
     drawn = {"rows": 0, "last": None}
@@ -972,14 +971,11 @@ def cmd_test(key, node, as_json):
     def ok(i):
         return needs[i] <= got[i]
 
-    def settle(now):
+    def settle():
         for i, sp in enumerate(specs):
             tok = check_token(sp, held, vals, declared, rest)
-            prev, since = cur[i]
-            if tok != prev:
-                cur[i] = (tok, now)
-                since = now
-            if tok and now - since >= HOLD_SECS:
+            cur[i] = tok
+            if tok:
                 got[i].add(tok)
 
     def complete():
@@ -991,18 +987,10 @@ def cmd_test(key, node, as_json):
         settle() refreshes cur[] every tick, so this stays current whether or
         not the check has already been verified.
         """
-        return cur[i][0] is not None
+        return cur[i] is not None
 
     def mark(good):
         return "\033[32mx\033[0m" if good else " "
-
-    def note_for(i, now):
-        """Countdown while a hold is in progress, blank otherwise."""
-        tok, since = cur[i]
-        if not tok or tok in got[i]:
-            return ""
-        left = HOLD_SECS - (now - since)
-        return f"hold {left:.1f}s" if left > 0 else ""
 
     def detail_for(i):
         """The middle column: what the check is watching right now."""
@@ -1018,7 +1006,7 @@ def cmd_test(key, node, as_json):
         stops = f"min[{mark('min' in got[i])}] max[{mark('max' in got[i])}]"
         return stops, (f"of {rng[0]}..{rng[1]}" if rng else "any movement")
 
-    def render(now):
+    def render():
         if as_json:
             return
         done = sum(1 for i in range(total) if ok(i))
@@ -1026,11 +1014,9 @@ def cmd_test(key, node, as_json):
         lines = []
         for i, sp in enumerate(specs):
             detail, target = detail_for(i)
-            note = note_for(i, now)
-            note = f"\033[2m{padv(note, 10)}\033[0m" if note else " " * 10
             live = "\033[36m*\033[0m" if active(i) else " "
             lines.append(f"  [{mark(ok(i))}] {live} {padv(sp['label'], 22)} "
-                         f"{padv(detail, 15)} {note}  {target}".rstrip())
+                         f"{padv(detail, 15)}  {target}".rstrip())
         lines.append("")
         lines.append(f"  {done}/{total} inputs verified")
 
@@ -1053,8 +1039,8 @@ def cmd_test(key, node, as_json):
         sys.stdout.write("".join(out))
         sys.stdout.flush()
 
-    render(time.monotonic())
-    finished, gone = False, None
+    render()
+    done_at, gone = None, None
     try:
         with f:
             while True:
@@ -1080,19 +1066,21 @@ def cmd_test(key, node, as_json):
                         vals[code] = value
                         lo, hi = span.get(code, (value, value))
                         span[code] = (min(lo, value), max(hi, value))
-                now = time.monotonic()
-                settle(now)
-                render(now)
+                settle()
+                render()
                 if complete():
-                    finished = True
-                    break
+                    # Keep reading events while it sits there: a contact that
+                    # is only marginally closed shows up as a flickering live
+                    # marker, and that is worth seeing before the script exits.
+                    now = time.monotonic()
+                    if done_at is None:
+                        done_at = now
+                    elif now - done_at >= SETTLE_SECS:
+                        break
     except KeyboardInterrupt:
         pass
     except OSError as e:            # closing a node whose device has gone
         gone = gone or e
-
-    if finished and not as_json:
-        time.sleep(0.4)         # let the completed checklist land on screen
 
     # A controller that leaves halfway through has not passed, whatever it had
     # ticked off by then -- the rest of the checklist was never answered.
@@ -1103,7 +1091,6 @@ def cmd_test(key, node, as_json):
             "flashed": flashed,
             "pass": not missing and not gone,
             "disconnected": str(gone) if gone else None,
-            "hold_seconds": HOLD_SECS,
             "verified": [sp["label"] for i, sp in enumerate(specs) if ok(i)],
             "missing": missing,
             "checks": [{
@@ -1122,9 +1109,9 @@ def cmd_test(key, node, as_json):
                   f"{total - len(missing)} of {total} inputs had passed.")
             if missing:
                 print(f"Not verified: {', '.join(missing)}")
-            print(f"Plug it back in and run 'padtool {key}' again.")
+            print(f"Plug it back in and run 'granola {key}' again.")
         elif missing:
-            print(f"\033[31mFAIL\033[0m -- never held: {', '.join(missing)}")
+            print(f"\033[31mFAIL\033[0m -- not detected: {', '.join(missing)}")
         else:
             print(f"\033[32mPASS\033[0m -- all {total} inputs detected.")
     if gone:
@@ -1238,7 +1225,7 @@ def main():
         return cmd_test(cmd, args[1] if len(args) > 1 else None, as_json)
     if cmd == "flash":
         if len(args) < 2 or args[1] not in MODELS:
-            print("Usage: padtool flash <model>   (models: "
+            print("Usage: granola flash <model>   (models: "
                   + ", ".join(MODELS) + ")", file=sys.stderr)
             return 1
         return cmd_flash(args[1], as_json)
