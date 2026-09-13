@@ -5,7 +5,9 @@ granola - verify every input on a Granola controller.
 
   granola <model> [event#]   find that model and test its inputs (--json ok)
   granola flash <model>      write that model's firmware to a blank board
+  granola flash <file.uf2>   write a .uf2 you name to a blank board
   granola nuke               erase a board's flash back to factory blank
+  granola webconfig          open a GP2040-CE board's settings page
   granola models             list the models this script knows about
   granola list               dump every connected pad's raw attributes
   granola probe [event#] [s] watch a pad live -- how a new profile is built
@@ -20,9 +22,13 @@ an RPI-RP2 USB drive. 'granola <model>' notices that, writes that model's
 firmware, waits for the board to reboot as a controller, and carries on
 into the tester, so a blank board and a finished one are the same command.
 
+Web config mode is the third thing a board can be. Hold Start while plugging
+a GP2040-CE board in and it comes up as a USB network adapter serving its own
+settings page instead of as a pad: 'granola webconfig' opens that page.
+
 Reads evdev directly. Python stdlib only, no evdev/SDL bindings.
 """
-import sys, os, re, time, glob, json, struct, select, fcntl
+import sys, os, re, time, glob, json, socket, struct, select, fcntl
 import subprocess, tempfile
 
 # struct input_event on 64-bit: time_sec, time_usec, type, code, value
@@ -296,6 +302,13 @@ def find(model):
 # itself. Two such drives attached is an error rather than a guess. Nothing on
 # the drive is deleted, and no other disk is read, mounted or touched.
 #
+# 'granola flash <file.uf2>' puts an image the operator names through exactly
+# that gauntlet, for test builds and one-offs. The file itself is checked the
+# same way a model's firmware is -- it has to be a real RP2040 UF2 -- but what
+# it does once it is running is its own business, so the board is only followed
+# as far as leaving the boot ROM, and whatever it enumerates as is reported
+# rather than required.
+#
 # 'granola nuke' writes one more image, and it is the destructive one: it
 # erases the board's own flash back to factory-blank. It runs the same gauntlet
 # for the same reason -- what makes that safe is being certain the thing on the
@@ -540,10 +553,16 @@ def write_firmware(mnt, fw, quiet=False):
     return done
 
 
-def do_flash(key, as_json=False):
-    """Flash this model's firmware onto the one blank board attached."""
-    model = MODELS[key]
-    fw = os.path.join(REPO, model["firmware"])
+def flash_image(fw, title, shown, becomes, as_json=False):
+    """Write one UF2 onto the single blank board attached.
+
+    Everything that decides *where* the bytes go -- exactly one RPI-RP2 drive,
+    mounted by this script, INFO_UF2.TXT confirmed -- is the same whether the
+    image is a model's firmware or a file the operator named, so it lives here
+    once. The caller supplies only the words: 'title' names the job, 'shown'
+    is the firmware as the operator should see it named, and 'becomes' is what
+    the board is expected to be once it reboots.
+    """
     bad = check_uf2(fw)
     if bad:
         raise FlashError(bad)
@@ -559,10 +578,10 @@ def do_flash(key, as_json=False):
     drive = drives[0]
 
     out = sys.stderr if as_json else sys.stdout
-    print(f"\n\033[1m{model['name']}\033[0m -- blank board on "
+    print(f"\n\033[1m{title}\033[0m -- blank board on "
           f"{drive['device']} (boot ROM {drive['usb']}, "
           f"SN {drive['serial'] or '?'})", file=out)
-    print(f"  firmware  {model['firmware']}  "
+    print(f"  firmware  {shown}  "
           f"({os.path.getsize(fw) >> 10} KiB)", file=out)
 
     mnt, ours = mount_drive(drive)
@@ -572,10 +591,17 @@ def do_flash(key, as_json=False):
     finally:
         if ours:
             unmount_drive(mnt)
-    print(f"Flashed. Waiting up to {FLASH_WAIT:g}s for it to reboot as a "
-          "controller...", file=out)
+    print(f"Flashed. Waiting up to {FLASH_WAIT:g}s for it to reboot as "
+          f"{becomes}...", file=out)
     return {"device": drive["device"], "serial": drive["serial"],
-            "firmware": model["firmware"], "bytes": written}
+            "firmware": shown, "bytes": written}
+
+
+def do_flash(key, as_json=False):
+    """Flash this model's firmware onto the one blank board attached."""
+    model = MODELS[key]
+    return flash_image(os.path.join(REPO, model["firmware"]), model["name"],
+                       model["firmware"], "a controller", as_json)
 
 
 def wait_for_pad(model, timeout=FLASH_WAIT):
@@ -623,6 +649,86 @@ def cmd_flash(key, as_json):
         return 1
     print(f"\033[32mOK\033[0m -- {model['name']} is up on "
           f"{found[0]['device']}. Run 'granola {key}' to test it.")
+    return 0
+
+
+def wait_for_reboot(drive, before, timeout=FLASH_WAIT):
+    """Watch a freshly flashed board leave the boot ROM, and see what it became.
+
+    A model's firmware gives wait_for_pad() something definite to wait for. A
+    file the operator named could be anything -- a pad, a keyboard, something
+    that never shows up on USB at all -- so what is reported instead is the
+    RPI-RP2 drive going away, which is the board taking the image and
+    resetting, plus any input device that was not there beforehand.
+
+    The drive is matched by boot ROM serial where there is one: /dev nodes get
+    reused, and the serial is the flash chip's own die ID.
+
+    Returns (left_the_boot_rom, [pads new since 'before']).
+    """
+    known = {p["device"] for p in before}
+    t0, gone = time.monotonic(), False
+    while time.monotonic() - t0 < timeout:
+        if not gone:
+            gone = not [d for d in bootloader_drives()
+                        if (d["serial"] == drive["serial"] if drive["serial"]
+                            else d["device"] == drive["device"])]
+        else:
+            new = [p for p in gamepads() if p["device"] not in known]
+            if new:
+                return True, new
+        time.sleep(0.25)
+    return gone, [p for p in gamepads() if p["device"] not in known]
+
+
+def cmd_flash_file(path, as_json):
+    """Flash a .uf2 the operator named -- a test build, or somebody else's.
+
+    Same board, same gauntlet, same one file by name. The only thing this
+    command does not do is claim to know what it has just made: it reports
+    whether the board took the image and what turned up on evdev afterwards,
+    and leaves judging the firmware to whoever built it.
+    """
+    fw = os.path.abspath(os.path.expanduser(path))
+    before = gamepads()
+    try:
+        info = flash_image(fw, os.path.basename(fw), fw,
+                           "whatever this firmware makes it", as_json)
+    except FlashError as e:
+        if as_json:
+            print(json.dumps({"command": "flash", "firmware": fw,
+                              "flashed": False, "error": str(e)}, indent=2))
+        else:
+            print(f"\033[31m{e}\033[0m", file=sys.stderr)
+        return 1
+
+    gone, new = wait_for_reboot(info, before)
+    for p in new:
+        p["matches"] = [k for k, m in MODELS.items() if matches(p, m)]
+
+    if as_json:
+        print(json.dumps({"command": "flash", "firmware": fw, "flashed": info,
+                          "rebooted": gone, "appeared": new}, indent=2))
+        return 0 if gone else 1
+    if not gone:
+        print(f"\033[31mThe {RP2_LABEL} drive on {info['device']} never went "
+              f"away within {FLASH_WAIT:g}s, so the board never took the "
+              f"image.\033[0m\nNothing was erased -- unplug it and plug it "
+              "back in holding BOOTSEL, then try again.", file=sys.stderr)
+        return 1
+    if not new:
+        print(f"\033[32mOK\033[0m -- board took the image and left the boot "
+              f"ROM, but nothing new appeared on evdev within {FLASH_WAIT:g}s."
+              "\nThat is right for firmware that is not a controller. Run "
+              "'granola list' to see what is attached.")
+        return 0
+    for p in new:
+        hit = p["matches"][0] if p["matches"] else None
+        print(f"\033[32mOK\033[0m -- board came back as \033[1m{p['name']}"
+              f"\033[0m ({p['vid']}:{p['pid']}) on {p['device']}"
+              + (f", which matches '{hit}'." if hit else "."))
+        if hit:
+            print(f"  Run 'granola {hit}' to test it.")
     return 0
 
 
@@ -742,6 +848,258 @@ def cmd_nuke(as_json):
         return 0
     print(f"\033[32mOK\033[0m -- board erased and back on {back['device']} "
           f"(SN {back['serial'] or '?'})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# The web configurator.
+#
+# GP2040-CE boards -- the Beacon -- have a third mode alongside "a gamepad"
+# and "a blank board in the boot ROM". Hold Start while plugging one in and it
+# boots as a USB network adapter instead of a pad, hands the host an address
+# over DHCP, and serves its settings page at http://192.168.7.1/.
+#
+# In that mode the board has no evdev node at all, so nothing above can see
+# it and the only honest check is whether the address answers. The Plateau
+# runs Haybox, which has no web configurator.
+# ---------------------------------------------------------------------------
+
+WEBCONFIG_HOST, WEBCONFIG_PORT = "192.168.7.1", 80
+WEBCONFIG_URL = f"http://{WEBCONFIG_HOST}/"
+WEBCONFIG_WAIT = 25.0           # seconds to give a board being re-plugged
+
+# Where a desktop program might live, once the session's own PATH is spent.
+# Deliberately not _tool()'s list: a browser installed in the operator's own
+# profile is exactly the one to launch, whereas sudo and mount are looked up
+# in system directories only, where the user cannot shadow them.
+OPENER_DIRS = ("/run/wrappers/bin",
+               os.path.expanduser("~/.nix-profile/bin"),
+               "/etc/profiles/per-user/" + os.environ.get("USER", "") + "/bin",
+               "/run/current-system/sw/bin", "/usr/local/bin", "/usr/bin",
+               "/bin")
+
+# Browsers to try by name once the desktop's own opener has had its go. This
+# is not as redundant as it looks: xdg-open carries a browser list of its own,
+# but a Debian-era one -- it knows iceweasel and seamonkey and has never heard
+# of librewolf -- so on a machine whose browser is not on that list, xdg-open
+# exits 3 and this is what actually opens the page.
+BROWSERS = ("firefox", "librewolf", "chromium", "chromium-browser",
+            "google-chrome-stable", "brave", "vivaldi-stable", "qutebrowser",
+            "epiphany", "falkon")
+
+
+def webconfig_up(timeout=1.0):
+    """True if something is listening on the board's settings page."""
+    try:
+        with socket.create_connection((WEBCONFIG_HOST, WEBCONFIG_PORT),
+                                      timeout):
+            return True
+    except OSError:
+        return False
+
+
+def usb_net_interfaces():
+    """Every USB network adapter attached -- what web config mode looks like.
+
+    Worth reporting when the page does not answer, because the two ways that
+    happens are indistinguishable from a failed connect: a board that is not
+    in web config mode at all, and one that is, whose interface the host has
+    not finished addressing.
+    """
+    out = []
+    for path in sorted(glob.glob("/sys/class/net/*")):
+        cur = os.path.join(path, "device")
+        if not os.path.exists(cur):
+            continue
+        cur = os.path.realpath(cur)
+        for _ in range(6):
+            if os.path.exists(os.path.join(cur, "idVendor")):
+                out.append({
+                    "interface": os.path.basename(path),
+                    "usb": (_read(f"{cur}/idVendor") + ":"
+                            + _read(f"{cur}/idProduct")),
+                    "product": _read(f"{cur}/product"),
+                    "operstate": _read(f"{path}/operstate"),
+                })
+                break
+            cur = os.path.dirname(cur)
+    return out
+
+
+def _ancestor_env():
+    """The environment of the nearest ancestor that still has a desktop session.
+
+    Same uid all the way up, so /proc hands these over without ceremony. The
+    walk stops at the first process that has D-Bus or a desktop name, which in
+    practice is the shell that invoked this script, one level above nix-shell.
+    """
+    def field(pid, name):
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith(name):
+                    return int(line.split()[1])
+        return 0
+
+    pid = os.getpid()
+    for _ in range(12):
+        try:
+            pid = field(pid, "PPid:")
+            if pid <= 1:
+                break
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                raw = f.read().decode("utf-8", "replace")
+        except (OSError, ValueError):
+            break
+        env = dict(kv.split("=", 1) for kv in raw.split("\0") if "=" in kv)
+        if env.get("DBUS_SESSION_BUS_ADDRESS") or env.get("XDG_CURRENT_DESKTOP"):
+            return env
+    return None
+
+
+def session_env():
+    """The environment this script was started with, before --pure took it.
+
+    Launching a browser from a pure nix-shell is the whole difficulty in this
+    command. --pure keeps HOME, DISPLAY and XDG_RUNTIME_DIR and drops the rest
+    of the desktop session: PATH loses the operator's browser, XDG_DATA_DIRS
+    and XDG_CURRENT_DESKTOP go, and so does DBUS_SESSION_BUS_ADDRESS, which is
+    how a URL gets handed to a desktop that is already running. xdg-open under
+    that environment searches a PATH with no browser on it and gives up.
+
+    None of it is really lost, though -- it is still sitting in the shell that
+    started us, so the first thing to try is borrowing it back. Failing that,
+    what can be rebuilt is rebuilt: the D-Bus socket has a well-known path
+    under XDG_RUNTIME_DIR, and the directories a browser is likely to be in
+    are known. Either way this is for the child; our own environment stands.
+    """
+    env = _ancestor_env() or dict(os.environ)
+    # Ours survived --pure and are certainly current; an ancestor high enough
+    # up the tree could predate the session they describe.
+    for k in ("DISPLAY", "WAYLAND_DISPLAY", "XDG_RUNTIME_DIR", "HOME", "USER"):
+        if os.environ.get(k) and not env.get(k):
+            env[k] = os.environ[k]
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        sock = os.path.join(env.get("XDG_RUNTIME_DIR", "/nonexistent"), "bus")
+        if os.path.exists(sock):
+            env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + sock
+    env["PATH"] = os.pathsep.join((env.get("PATH", ""),) + OPENER_DIRS)
+    return env
+
+
+def _opener(name, env):
+    """Absolute path to a desktop program, looked up on the session's PATH."""
+    if os.path.isabs(name):
+        return name if os.path.exists(name) else None
+    for d in env.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, name)
+        if d and os.path.exists(p):
+            return p
+    return None
+
+
+def open_browser(url):
+    """Hand the URL to the desktop. Returns the program that took it, or None.
+
+    $BROWSER first if the operator set one, then the desktop's own opener --
+    which respects whatever default they configured -- and only then browsers
+    by name.
+
+    Each is launched detached with its stdio closed: a browser started from a
+    terminal holds that terminal for as long as its window is open, and the
+    operator wants their prompt back. One that comes straight back with an
+    error did not work, so the next candidate gets a turn; one that is still
+    running is the browser itself, which is the good case.
+    """
+    env = session_env()
+    names = ["xdg-open", "gio"] + list(BROWSERS)
+    pref = env.get("BROWSER", "")
+    if pref and " " not in pref and "%" not in pref:
+        names.insert(0, pref)       # a bare name or path; not a template
+    for name in names:
+        exe = _opener(name, env)
+        if not exe:
+            continue
+        cmd = ([exe, "open", url] if os.path.basename(exe) == "gio"
+               else [exe, url])
+        try:
+            proc = subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+        except OSError:
+            continue
+        rc, t0 = None, time.monotonic()
+        while rc is None and time.monotonic() - t0 < 2.0:
+            rc = proc.poll()
+            if rc is None:
+                time.sleep(0.1)
+        if rc is None or rc == 0:
+            return os.path.basename(exe)
+    return None
+
+
+def cmd_webconfig(as_json):
+    """Open the settings page of a board that is in web config mode."""
+    out = sys.stderr if as_json else sys.stdout
+    up = webconfig_up()
+
+    if not up:
+        print(f"\n\033[1mWeb configurator\033[0m -- nothing is answering on "
+              f"{WEBCONFIG_URL} yet.", file=out)
+        for n in usb_net_interfaces():
+            print(f"  USB network adapter {n['interface']} ({n['usb']}"
+                  + (f", {n['product']}" if n["product"] else "")
+                  + f"), link {n['operstate'] or 'unknown'}", file=out)
+        for key in (k for k, m in MODELS.items() if find(m)):
+            print(f"  {MODELS[key]['name']} is attached and running as a pad"
+                  + (" -- Haybox, no web configurator"
+                     if key == "plateau" else ""), file=out)
+        print("  Unplug the controller, hold Start, and plug it back in.",
+              file=out)
+
+        t0 = time.monotonic()
+        while True:
+            left = WEBCONFIG_WAIT - (time.monotonic() - t0)
+            if left <= 0:
+                break
+            if not as_json:
+                sys.stdout.write(f"\r  waiting for {WEBCONFIG_HOST} -- "
+                                 f"{left:.0f}s left\033[K")
+                sys.stdout.flush()
+            if webconfig_up():
+                up = True
+                break
+            time.sleep(0.5)
+        if not as_json:
+            sys.stdout.write("\r\033[K")
+
+    if not up:
+        msg = (f"Nothing answered on {WEBCONFIG_URL} within "
+               f"{WEBCONFIG_WAIT:g}s.")
+        if as_json:
+            print(json.dumps({"command": "webconfig", "url": WEBCONFIG_URL,
+                              "reachable": False, "opened": None,
+                              "usb_network": usb_net_interfaces(),
+                              "error": msg}, indent=2))
+        else:
+            print(f"\033[31m{msg}\033[0m\nA GP2040-CE board only enters web "
+                  "config mode at boot: unplug it, hold Start, and plug it "
+                  "back in.\nThe Plateau runs Haybox and has no web "
+                  "configurator.", file=sys.stderr)
+        return 1
+
+    print(f"{WEBCONFIG_URL} is answering.", file=out)
+    opened = open_browser(WEBCONFIG_URL)
+    if as_json:
+        print(json.dumps({"command": "webconfig", "url": WEBCONFIG_URL,
+                          "reachable": True, "opened": opened,
+                          "usb_network": usb_net_interfaces()}, indent=2))
+        return 0
+    if opened:
+        print(f"\033[32mOK\033[0m -- opened it with {opened}.")
+    else:
+        print("\033[33mNo browser found to open it with\033[0m -- go to "
+              f"\033[1m{WEBCONFIG_URL}\033[0m yourself.")
     return 0
 
 
@@ -1224,13 +1582,27 @@ def main():
     if cmd in MODELS:
         return cmd_test(cmd, args[1] if len(args) > 1 else None, as_json)
     if cmd == "flash":
-        if len(args) < 2 or args[1] not in MODELS:
-            print("Usage: granola flash <model>   (models: "
-                  + ", ".join(MODELS) + ")", file=sys.stderr)
-            return 1
-        return cmd_flash(args[1], as_json)
+        # A model name flashes what we ship for it and then waits for that
+        # exact controller; anything else is taken as a path to a .uf2. A
+        # typo'd model name should not become a hunt for a missing file, so
+        # only something that looks like one -- named .uf2, or actually on
+        # disk -- is treated that way.
+        target = args[1] if len(args) > 1 else ""
+        if target in MODELS:
+            return cmd_flash(target, as_json)
+        if (target.lower().endswith(".uf2")
+                or os.path.isfile(os.path.expanduser(target or "."))):
+            return cmd_flash_file(target, as_json)
+        print("Usage: granola flash <model|file.uf2>   (models: "
+              + ", ".join(MODELS) + ")", file=sys.stderr)
+        if target:
+            print(f"  {target} is neither a model nor a .uf2 file.",
+                  file=sys.stderr)
+        return 1
     if cmd == "nuke":
         return cmd_nuke(as_json)
+    if cmd == "webconfig":
+        return cmd_webconfig(as_json)
     if cmd == "models":
         return cmd_models()
     if cmd == "list":
