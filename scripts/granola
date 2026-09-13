@@ -1038,54 +1038,100 @@ def open_browser(url):
     return None
 
 
-def cmd_webconfig(as_json):
-    """Open the settings page of a board that is in web config mode."""
-    out = sys.stderr if as_json else sys.stdout
-    up = webconfig_up()
+def webconfig_state():
+    """What is on the end of the cable, as far as this command cares.
 
-    if not up:
-        print(f"\n\033[1mWeb configurator\033[0m -- nothing is answering on "
-              f"{WEBCONFIG_URL} yet.", file=out)
+      "up"       the settings page answers -- the board is in web config mode
+      "pad"      one of our controllers is running its firmware, so it is not
+      "nothing"  neither, which is also what a board mid-replug looks like
+
+    Returns (state, model key or None).
+    """
+    if webconfig_up():
+        return "up", None
+    for key, m in MODELS.items():
+        if find(m):
+            return "pad", key
+    return "nothing", None
+
+
+def cmd_webconfig(as_json):
+    """Open the settings page of a board that is in web config mode.
+
+    A board only enters that mode at boot, so unless it is already in it the
+    operator has to re-plug it holding Start. Rather than check once and fail,
+    this waits for them to do it and says what it can see while it waits --
+    which is the difference between a command that works at the bench and one
+    that has to be run twice.
+    """
+    out = sys.stderr if as_json else sys.stdout
+    state, key = webconfig_state()
+    interrupted = False
+
+    if state != "up":
+        print(f"\n\033[1mWeb configurator\033[0m -- "
+              + (f"{MODELS[key]['name']} is plugged in and running as a pad."
+                 if state == "pad" else "no Granola controller detected."),
+              file=out)
         for n in usb_net_interfaces():
             print(f"  USB network adapter {n['interface']} ({n['usb']}"
                   + (f", {n['product']}" if n["product"] else "")
                   + f"), link {n['operstate'] or 'unknown'}", file=out)
-        for key in (k for k, m in MODELS.items() if find(m)):
-            print(f"  {MODELS[key]['name']} is attached and running as a pad"
-                  + (" -- Haybox, no web configurator"
-                     if key == "plateau" else ""), file=out)
-        print("  Unplug the controller, hold Start, and plug it back in.",
+        if key == "plateau":
+            print("  The Plateau runs Haybox and has no web configurator -- "
+                  "this only works on the Beacon.", file=out)
+        print("  \033[1mUnplug the controller, then plug it back in holding "
+              "Start.\033[0m" if state == "pad" else
+              "  \033[1mPlug the controller in holding Start.\033[0m",
               file=out)
 
+        # Then wait for them to actually do it. At a terminal that wait is
+        # open-ended -- this is a bench command, the operator is stood at the
+        # cable, and a board being re-plugged takes as long as it takes. A
+        # --json run or a redirected one keeps a bounded wait so that nothing
+        # driving this script can hang on it.
+        patient = not as_json and sys.stdout.isatty()
+        if patient:
+            print("  (Ctrl-C to give up.)", file=out)
         t0 = time.monotonic()
-        while True:
-            left = WEBCONFIG_WAIT - (time.monotonic() - t0)
-            if left <= 0:
-                break
-            if not as_json:
-                sys.stdout.write(f"\r  waiting for {WEBCONFIG_HOST} -- "
-                                 f"{left:.0f}s left\033[K")
-                sys.stdout.flush()
-            if webconfig_up():
-                up = True
-                break
-            time.sleep(0.5)
+        try:
+            while state != "up":
+                if not patient and time.monotonic() - t0 >= WEBCONFIG_WAIT:
+                    break
+                if not as_json:
+                    # The prompt tracks what is actually on the bus, so the
+                    # unplug is acknowledged the moment it happens instead of
+                    # leaving the operator wondering if they were seen.
+                    sys.stdout.write(
+                        "\r  waiting -- "
+                        + ("unplug it now" if state == "pad"
+                           else "plug it in holding Start")
+                        + f"  ({time.monotonic() - t0:.0f}s)\033[K")
+                    sys.stdout.flush()
+                time.sleep(0.5)
+                state, key = webconfig_state()
+        except KeyboardInterrupt:
+            interrupted = True
         if not as_json:
             sys.stdout.write("\r\033[K")
 
-    if not up:
-        msg = (f"Nothing answered on {WEBCONFIG_URL} within "
+    if state != "up":
+        msg = ("Gave up waiting for a board in web config mode."
+               if interrupted else
+               f"Nothing answered on {WEBCONFIG_URL} within "
                f"{WEBCONFIG_WAIT:g}s.")
         if as_json:
             print(json.dumps({"command": "webconfig", "url": WEBCONFIG_URL,
                               "reachable": False, "opened": None,
+                              "state": state,
                               "usb_network": usb_net_interfaces(),
                               "error": msg}, indent=2))
         else:
-            print(f"\033[31m{msg}\033[0m\nA GP2040-CE board only enters web "
-                  "config mode at boot: unplug it, hold Start, and plug it "
-                  "back in.\nThe Plateau runs Haybox and has no web "
-                  "configurator.", file=sys.stderr)
+            print(f"\033[31m{msg}\033[0m", file=sys.stderr)
+            if not interrupted:
+                print("A GP2040-CE board only enters web config mode at boot: "
+                      "unplug it, hold Start, and plug it back in.",
+                      file=sys.stderr)
         return 1
 
     print(f"{WEBCONFIG_URL} is answering.", file=out)
@@ -1093,6 +1139,7 @@ def cmd_webconfig(as_json):
     if as_json:
         print(json.dumps({"command": "webconfig", "url": WEBCONFIG_URL,
                           "reachable": True, "opened": opened,
+                          "state": state,
                           "usb_network": usb_net_interfaces()}, indent=2))
         return 0
     if opened:
