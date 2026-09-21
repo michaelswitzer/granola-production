@@ -1,0 +1,100 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i bash -p xdotool xprop
+#
+# granola-factory - open the three windows an order session needs, tiled.
+#
+#   the Shopify orders page, the slicer, and a terminal here
+#
+# Reached from the dwl app launcher on mod+space: nixos-config lists
+# "granola-factory" in menuApps, and this directory is already on PATH from
+# home.sessionPath, so the entry finds this file. Nothing about it is specific
+# to the launcher, though -- run it from a shell and it does the same thing.
+#
+# Not --pure, unlike the granola script next door. The three applications are
+# the session's own: foot comes from the dwl module and orca-slicer and the
+# wrapped LibreWolf from home-manager, and each is found on PATH. Only xdotool
+# and xprop come from the shebang, because nothing on this machine installs
+# them and the wait below cannot be done without them.
+
+set -u
+
+here="$HOME/Documents/granola-production"
+url="https://admin.shopify.com/store/my-store/orders"
+
+# Why the windows are opened in this order, which is backwards from how they
+# are read:
+#
+# dwl has no IPC and no foreign-toplevel protocol, so nothing can focus, move
+# or promote a window once it exists. The only lever anything outside the
+# compositor has is the order the windows appear in. dwl's attach() inserts
+# each new client at the *head* of its client list and tile() walks that list
+# in order, giving the first nmaster (one) the master area and the rest the
+# stack top to bottom. So the newest window is master and the ones before it
+# stack newest-first underneath.
+#
+# LibreWolf master, the slicer above the terminal, is therefore exactly this
+# sequence reversed. Anything already on the tag keeps its relative order and
+# is pushed below the three.
+#
+# setsid rather than a bare `&` on all three, because this script outlives
+# none of them: it has a last window to wait for and then it is done, and dwl
+# spawns it into a session of its own. A plain background job is still in that
+# session when it ends, and the slicer does not survive it -- it went away a
+# second after the browser appeared, every time. foot and LibreWolf happen to
+# sit through it, which is what made the slicer look like it was crashing on
+# its own. -f so setsid forks and returns rather than becoming the app.
+
+setsid -f foot -D "$here"
+
+# Long enough only because the step after it takes seconds. foot maps in tens
+# of milliseconds, and this is a guess rather than a measurement -- the one in
+# the script. The wait that actually matters is the slicer's, below.
+sleep 0.5
+
+setsid -f orca-slicer
+
+# pkgs/orca-slicer-appimage in nixos-config forces GDK_BACKEND=x11, so the
+# slicer runs through XWayland and its windows are X windows -- which is the
+# only reason this can be a wait rather than another sleep. It is also the
+# window worth waiting for: about six seconds warm, longer cold.
+#
+# Two things have to be true of the window before it counts, and both were
+# found by watching a real start rather than reasoned about:
+#
+#   WM_STATE     wlroots' xwm sets it when it takes a window as a managed
+#                client, which is the moment the window enters the list
+#                tile() walks. Without it this matches the two unmanaged
+#                helper windows the slicer also creates.
+#
+#   a title      the splash screen is managed and so carries WM_STATE too,
+#                appearing around two seconds in and going away when the real
+#                window arrives. It has no WM_NAME; the real window is
+#                "<project> - OrcaSlicer". Waiting on WM_STATE alone would
+#                release on the splash and hand master to the slicer.
+#
+# xdotool's regexes are POSIX and matched case-insensitively, so ^orcaslicer$
+# is the class "OrcaSlicer" and not the "Orca-slicer" one of the helpers uses.
+slicer_is_up() {
+  local id
+  for id in $(xdotool search --class '^orcaslicer$' 2>/dev/null); do
+    xprop -id "$id" WM_STATE 2>/dev/null | grep -q '^WM_STATE(WM_STATE)' || continue
+    [ -n "$(xdotool getwindowname "$id" 2>/dev/null)" ] || continue
+    return 0
+  done
+  return 1
+}
+
+# A ceiling rather than a promise: if the slicer never comes up, carry on and
+# open the browser anyway. Three windows in the wrong order beats two windows,
+# and a launcher entry that hangs silently is worse than either.
+deadline=$(( SECONDS + 90 ))
+until slicer_is_up; do
+  (( SECONDS < deadline )) || break
+  sleep 0.3
+done
+
+# Last, so it maps last and takes the master area. With a browser already
+# running this routes through that instance and opens a window in it; with
+# nothing running it starts one. Either way the app_id stays "librewolf",
+# which is what the dwl opacity rule in nixos-config matches on.
+setsid -f librewolf --new-window "$url"
