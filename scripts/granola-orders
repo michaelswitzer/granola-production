@@ -1,0 +1,481 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p python3 cacert --pure
+"""
+granola-orders - read open Shopify orders and the colors picked on them.
+
+  granola-orders summary   what to print for every open order, one line
+                           per color: its cases and buttons (--json ok)
+  granola-orders done <color> [cases|buttons]
+                           check a color off as printed -- what the last
+                           summary showed of it, and nothing newer
+  granola-orders undo <color> [cases|buttons]
+                           take a check-off back
+  granola-orders dump      every open order, line item by line item,
+                           with all of its properties (--json for raw)
+
+Colors are chosen through Qikify Product Options, which writes each choice
+onto the order's line item as a property -- what the admin order page shows
+under the item. The Admin API calls those customAttributes, so read_orders
+is the only scope this needs.
+
+Credentials live outside the repo, in ~/.config/granola/shopify.env:
+
+  SHOPIFY_STORE=my-store
+  SHOPIFY_CLIENT_ID=...          from a Dev Dashboard app installed on the
+  SHOPIFY_CLIENT_SECRET=...      store; traded for a 24h token every run
+  # or instead:
+  SHOPIFY_TOKEN=shpat_...        a legacy custom app's Admin API token
+
+Check-offs are saved in ~/.local/state/granola/printed.json, per order, so
+they survive between runs and a later order in the same color still shows
+up as to print.
+
+Python stdlib only.
+"""
+import sys, os, re, json, urllib.request, urllib.parse, urllib.error
+
+API_VERSION = "2026-07"
+ENV_FILE = os.path.expanduser("~/.config/granola/shopify.env")
+
+# ---------------------------------------------------------------------------
+# What each product is made of, keyed by the line item's title in Shopify.
+#
+# Every model has one case, colored by CASE_FIELD. Buttons come in groups:
+# (Qikify field, button shape, how many). A shape is a physical part -- two
+# groups of the same shape and color are the same thing on the shelf, and
+# are added together.
+#
+#   buttons      groups that are always colored field by field
+#   all_buttons  (field, shape, count) for a model that also offers one
+#                color for every button; its value is either that color or
+#                PER_GROUP, and only PER_GROUP sends us to `buttons`
+#
+# Fields starting with "_" (_itemKey, _optionSetId) are Qikify bookkeeping.
+
+CASE_FIELD = "Case Color"
+PER_GROUP = "Different Colors For Each Button"
+
+MODELS = {
+    "Plateau": {
+        "all_buttons": ("Button Color", "Plateau button", 21),
+        "buttons": [
+            ("Directions, MX, MY Color",                 "Plateau button", 6),
+            ("C-Stick Buttons Color",                    "Plateau button", 4),
+            ("A Button Color",                           "Plateau button", 1),
+            ("B Button Color",                           "Plateau button", 1),
+            ("Z Button Color",                           "Plateau button", 1),
+            ("L, R, X, Y Button Color",                  "Plateau button", 4),
+            ("Shield, Start, Dpad Toggle Buttons Color", "Plateau button", 4),
+        ],
+    },
+    "Beacon": {
+        "buttons": [
+            ("24mm Buttons Color", "24mm button", 13),
+            ("30mm Buttons Color", "30mm button", 2),
+            ("Menu Buttons Color", "menu button", 3),
+        ],
+    },
+}
+
+ORDERS_QUERY = """
+query($cursor: String) {
+  orders(first: 50, after: $cursor, query: "status:open", sortKey: CREATED_AT) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      name
+      createdAt
+      displayFulfillmentStatus
+      displayFinancialStatus
+      customAttributes { key value }
+      lineItems(first: 100) {
+        nodes {
+          id
+          title
+          variantTitle
+          sku
+          quantity
+          currentQuantity
+          unfulfilledQuantity
+          customAttributes { key value }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    conf = {}
+    try:
+        with open(ENV_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                conf[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        die(f"No credentials: create {ENV_FILE} (see granola-orders --help).")
+    if not conf.get("SHOPIFY_STORE"):
+        die(f"SHOPIFY_STORE is not set in {ENV_FILE}.")
+    return conf
+
+
+def post(url, body, headers):
+    req = urllib.request.Request(url, data=body, headers=headers,
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        text = e.read().decode(errors="replace")
+        # Shopify answers OAuth failures with a whole HTML error page; the
+        # one useful line is its <title>, e.g. "Oauth error app_not_installed".
+        m = re.search(r"<title>(.*?)</title>", text, re.S)
+        die(f"{url}: HTTP {e.code}\n{m.group(1).strip() if m else text}")
+    except urllib.error.URLError as e:
+        die(f"{url}: {e.reason}")
+
+
+def access_token(conf, shop):
+    if conf.get("SHOPIFY_TOKEN"):
+        return conf["SHOPIFY_TOKEN"]
+    cid, secret = conf.get("SHOPIFY_CLIENT_ID"), conf.get("SHOPIFY_CLIENT_SECRET")
+    if not (cid and secret):
+        die(f"Set SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET "
+            f"(or SHOPIFY_TOKEN) in {ENV_FILE}.")
+    body = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": cid,
+        "client_secret": secret,
+    }).encode()
+    r = post(f"https://{shop}/admin/oauth/access_token", body,
+             {"Content-Type": "application/x-www-form-urlencoded"})
+    if "access_token" not in r:
+        die(f"No access token in response: {r}")
+    return r["access_token"]
+
+
+def open_orders():
+    conf = load_config()
+    shop = conf["SHOPIFY_STORE"]
+    if not shop.endswith(".myshopify.com"):
+        shop += ".myshopify.com"
+    token = access_token(conf, shop)
+    url = f"https://{shop}/admin/api/{API_VERSION}/graphql.json"
+    headers = {"Content-Type": "application/json",
+               "X-Shopify-Access-Token": token}
+    orders, cursor = [], None
+    while True:
+        body = json.dumps({"query": ORDERS_QUERY,
+                           "variables": {"cursor": cursor}}).encode()
+        r = post(url, body, headers)
+        if r.get("errors"):
+            die("GraphQL errors:\n" + json.dumps(r["errors"], indent=2))
+        page = r["data"]["orders"]
+        orders += page["nodes"]
+        if not page["pageInfo"]["hasNextPage"]:
+            return orders
+        cursor = page["pageInfo"]["endCursor"]
+
+
+def cmd_dump(as_json):
+    orders = open_orders()
+    if as_json:
+        print(json.dumps(orders, indent=2))
+        return 0
+    print(f"{len(orders)} open order(s)\n")
+    for o in orders:
+        print(f"{o['name']}  {o['createdAt'][:10]}  "
+              f"{o['displayFulfillmentStatus']} / {o['displayFinancialStatus']}")
+        for a in o["customAttributes"]:
+            print(f"    [order] {a['key']}: {a['value']}")
+        for li in o["lineItems"]["nodes"]:
+            variant = f" ({li['variantTitle']})" if li["variantTitle"] else ""
+            qty = li["quantity"]
+            if li["currentQuantity"] != qty:
+                qty = f"{li['currentQuantity']} (was {qty})"
+            print(f"  {qty} x {li['title']}{variant}"
+                  + (f"  sku {li['sku']}" if li["sku"] else ""))
+            for a in li["customAttributes"]:
+                print(f"      {a['key']}: {a['value']}")
+        print()
+    return 0
+
+
+def parts_for(title, attrs):
+    """The (kind, name, color, count) parts one unit of a line item needs,
+    plus a list of problems. A problem means the tally for this item is
+    incomplete, so the caller must show it rather than carry on quietly."""
+    model = MODELS.get(title)
+    if model is None:
+        return [], [f"unknown product '{title}' -- not counted"]
+    parts, problems = [], []
+    used = {CASE_FIELD}
+
+    def color(field):
+        v = attrs.get(field, "").strip()
+        if not v:
+            problems.append(f"missing '{field}'")
+        return v
+
+    c = color(CASE_FIELD)
+    if c:
+        parts.append(("case", f"{title} case", c, 1))
+
+    groups = model["buttons"]
+    if "all_buttons" in model:
+        field, shape, count = model["all_buttons"]
+        used.add(field)
+        v = color(field)
+        if v and v != PER_GROUP:
+            groups = []
+            parts.append(("button", shape, v, count))
+    for field, shape, count in groups:
+        used.add(field)
+        v = color(field)
+        if v:
+            parts.append(("button", shape, v, count))
+
+    extra = [k for k in attrs if not k.startswith("_") and k not in used]
+    # A per-group field left over from a single-color order is Qikify
+    # remembering a hidden choice, not something the customer bought.
+    extra = [k for k in extra
+             if k not in {f for f, _, _ in model["buttons"]}]
+    for k in extra:
+        problems.append(f"unrecognised option '{k}: {attrs[k]}'")
+    return parts, problems
+
+
+def needed(orders):
+    """Every part the open orders still need, as rows of
+    (line item id, order name, kind, part, color, count), plus the problems
+    parts_for() found and a line per line item that was counted."""
+    rows, problems, counted = [], [], []
+    for o in orders:
+        for li in o["lineItems"]["nodes"]:
+            # Open only means not archived: a shipped order can still be open.
+            qty = li["unfulfilledQuantity"]
+            if not qty:
+                continue
+            attrs = {a["key"]: a["value"] for a in li["customAttributes"]}
+            parts, bad = parts_for(li["title"], attrs)
+            problems += [f"{o['name']} {li['title']}: {p}" for p in bad]
+            if parts:
+                counted.append(f"{o['name']} {qty}x {li['title']}")
+            for kind, name, col, n in parts:
+                rows.append((li["id"], o["name"], kind, name, col, n * qty))
+    return rows, problems, counted
+
+
+# ---------------------------------------------------------------------------
+# What has been printed, kept between runs in STATE_FILE.
+#
+# A check-off is recorded against the order line items it was printed for,
+# never as a bare "N Black cases" count. That is what lets a new order in a
+# color that is already printed show up as still to print: its line item has
+# nothing recorded against it. When an order ships or is cancelled it drops
+# out of the open orders, and what was recorded for it is dropped with it.
+#
+#   printed   {line item id: {"kind|part|color": count}}
+#   shown     the to-print rows the last summary displayed. `done` marks
+#             only those, so an order that arrives between looking at the
+#             list and checking a color off is not marked printed unseen.
+
+STATE_FILE = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "granola", "printed.json")
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"printed": {}, "shown": []}
+
+
+def save_state(state):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE_FILE)
+
+
+def pkey(kind, name, col):
+    return f"{kind}|{name}|{col}"
+
+
+def split(rows, printed):
+    """Divide needed rows into what is still to print and what is printed."""
+    todo, done = [], []
+    for li, order, kind, name, col, n in rows:
+        have = min(n, printed.get(li, {}).get(pkey(kind, name, col), 0))
+        if have:
+            done.append((li, order, kind, name, col, have))
+        if n - have:
+            todo.append((li, order, kind, name, col, n - have))
+    return todo, done
+
+
+def items(counts):
+    """'1 Plateau case, 21 Plateau buttons' from {(kind, part): n}.
+    Cases before buttons."""
+    order = sorted(counts, key=lambda kn: (kn[0] != "case", kn[1]))
+    return ", ".join(f"{counts[kn]} {kn[1]}{'s' if counts[kn] != 1 else ''}"
+                     for kn in order)
+
+
+def print_colors(rows, width):
+    """One line per color, because a print bed holds one color: everything
+    on a line can be printed together. Colors with a case come first."""
+    by_color = {}
+    for _, _, kind, name, col, n in rows:
+        c = by_color.setdefault(col, {})
+        c[(kind, name)] = c.get((kind, name), 0) + n
+    has_case = lambda c: any(k == "case" for k, _ in by_color[c])
+    for col in sorted(by_color, key=lambda c: (not has_case(c), c)):
+        print(f"  {col + ':':<{width}}  {items(by_color[col])}")
+
+
+def cmd_summary(as_json):
+    orders = open_orders()
+    rows, problems, counted = needed(orders)
+    state = load_state()
+    # Forget line items that are no longer waiting: shipped or cancelled.
+    live = {r[0] for r in rows}
+    state["printed"] = {li: p for li, p in state["printed"].items()
+                        if li in live}
+    todo, done = split(rows, state["printed"])
+    state["shown"] = todo
+    save_state(state)
+
+    if as_json:
+        row = lambda r: {"order": r[1], "kind": r[2], "part": r[3],
+                         "color": r[4], "count": r[5]}
+        print(json.dumps({
+            "orders": [o["name"] for o in orders],
+            "to_print": [row(r) for r in todo],
+            "printed": [row(r) for r in done],
+            "problems": problems,
+        }, indent=2))
+        return 1 if problems else 0
+
+    print(f"{len(orders)} open order(s): "
+          + ", ".join(o["name"] for o in orders))
+    for c in counted:
+        print(f"  {c}")
+    width = max((len(r[4]) for r in rows), default=0) + 1
+    width = max(width, len("All open orders:"))
+
+    print("\nTo print")
+    if todo:
+        print_colors(todo, width)
+    else:
+        print("  nothing -- every open order is printed")
+    if done:
+        print("\nPrinted, waiting to ship")
+        print_colors(done, width)
+    # Everything the open orders need, printed or not, so a count off by a
+    # button stands out against 21 a Plateau.
+    parts = {}
+    for _, _, kind, name, _, n in rows:
+        parts[(kind, name)] = parts.get((kind, name), 0) + n
+    if parts:
+        print(f"\n  {'All open orders:':<{width}}  {items(parts)}")
+    if problems:
+        print("\nNOT COUNTED -- fix these and rerun:", file=sys.stderr)
+        for p in problems:
+            print(f"  {p}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def pick(rows, words):
+    """The rows for a color, optionally narrowed to cases or buttons, from
+    a command line like ['light', 'blue', 'cases']."""
+    kind = None
+    if words and words[-1].lower().rstrip("s") in ("case", "button"):
+        kind = words.pop().lower().rstrip("s")
+    col = " ".join(words).strip().lower()
+    return [r for r in rows
+            if r[4].lower() == col and (kind is None or r[2] == kind)]
+
+
+def cmd_done(words):
+    """Check a color off as printed: the rows of it the last summary showed."""
+    state = load_state()
+    if not words:
+        die("Usage: granola-orders done <color> [cases|buttons]")
+    rows = pick([tuple(r) for r in state["shown"]], list(words))
+    if not rows:
+        colors = sorted({r[4] for r in state["shown"]})
+        die(f"Nothing to print in '{' '.join(words)}' in the last summary."
+            + (f"\nColors to print: {', '.join(colors)}" if colors else
+               "\nRun 'granola-orders summary' first."))
+    for li, order, kind, name, col, n in rows:
+        p = state["printed"].setdefault(li, {})
+        k = pkey(kind, name, col)
+        p[k] = p.get(k, 0) + n
+    shown = set(rows)
+    state["shown"] = [r for r in state["shown"] if tuple(r) not in shown]
+    save_state(state)
+    counts = {}
+    for _, _, kind, name, _, n in rows:
+        counts[(kind, name)] = counts.get((kind, name), 0) + n
+    print(f"Printed {rows[0][4]}: {items(counts)}  "
+          f"({', '.join(sorted({r[1] for r in rows}))})\n")
+    return cmd_summary(False)
+
+
+def cmd_undo(words):
+    """Take a color's check-off back, for every open order."""
+    if not words:
+        die("Usage: granola-orders undo <color> [cases|buttons]")
+    state = load_state()
+    words = list(words)
+    kind = None
+    if words[-1].lower().rstrip("s") in ("case", "button"):
+        kind = words.pop().lower().rstrip("s")
+    col = " ".join(words).strip().lower()
+    hit = False
+    for li, p in state["printed"].items():
+        for k in list(p):
+            kk, _, c = k.split("|")
+            if c.lower() == col and (kind is None or kk == kind):
+                del p[k]
+                hit = True
+    if not hit:
+        die(f"Nothing in '{' '.join(words)}' is checked off.")
+    save_state(state)
+    return cmd_summary(False)
+
+
+def main():
+    args = sys.argv[1:]
+    as_json = "--json" in args
+    args = [a for a in args if a != "--json"]
+    cmd = args[0] if args else ""
+    if cmd == "summary":
+        return cmd_summary(as_json)
+    if cmd == "done":
+        return cmd_done(args[1:])
+    if cmd == "undo":
+        return cmd_undo(args[1:])
+    if cmd == "dump":
+        return cmd_dump(as_json)
+    if cmd and cmd not in ("-h", "--help", "help"):
+        print(f"Unknown command: {cmd}\n", file=sys.stderr)
+    print(__doc__)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
