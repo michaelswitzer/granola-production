@@ -44,7 +44,12 @@ url="https://admin.shopify.com/store/my-store/orders"
 # sit through it, which is what made the slicer look like it was crashing on
 # its own. -f so setsid forks and returns rather than becoming the app.
 
-setsid -f foot -D "$here"
+#
+# The terminal opens on what there is to print. foot runs the command in
+# place of the shell, so the shell is exec'd after it to leave a prompt under
+# the summary, and a failed summary (no network, a stale token) still does.
+
+setsid -f foot -D "$here" sh -c 'scripts/granola-orders summary; exec "$SHELL"'
 
 # Long enough only because the step after it takes seconds. foot maps in tens
 # of milliseconds, and this is a guess rather than a measurement -- the one in
