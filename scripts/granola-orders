@@ -12,6 +12,8 @@ granola-orders - read open Shopify orders and the colors picked on them.
                            take a check-off back
   granola-orders count     how many open orders still have something to
                            ship, as a bare number; reads, never writes
+  granola-orders pending   those orders, one line each with what is left
+                           to ship in it; reads, never writes
   granola-orders dump      every open order, line item by line item,
                            with all of its properties (--json for raw)
 
@@ -400,14 +402,35 @@ def cmd_summary(as_json):
     return 0
 
 
+def to_ship(orders):
+    """The open orders with anything left unfulfilled, each with its
+    unfulfilled line items as (quantity, title)."""
+    out = []
+    for o in orders:
+        items = [(li["unfulfilledQuantity"], li["title"])
+                 for li in o["lineItems"]["nodes"]
+                 if li["unfulfilledQuantity"]]
+        if items:
+            out.append((o, items))
+    return out
+
+
 def cmd_count():
     """The number of open orders with anything left unfulfilled. For the
     dwl bar, which polls it: unlike summary, it leaves the state file
     alone, so `done` still marks only what a summary actually showed."""
-    orders = open_orders()
-    print(sum(1 for o in orders
-              if any(li["unfulfilledQuantity"]
-                     for li in o["lineItems"]["nodes"])))
+    print(len(to_ship(open_orders())))
+    return 0
+
+
+def cmd_pending():
+    """What count counts, an order a line. For the card the dwl bar's
+    icon opens, and read-only for the same reason as count."""
+    pending = to_ship(open_orders())
+    print(f"{len(pending)} order(s) to ship")
+    for o, items in pending:
+        print(f"  {o['name']}  "
+              + ", ".join(f"{n}x {title}" for n, title in items))
     return 0
 
 
@@ -484,6 +507,8 @@ def main():
         return cmd_undo(args[1:])
     if cmd == "count":
         return cmd_count()
+    if cmd == "pending":
+        return cmd_pending()
     if cmd == "dump":
         return cmd_dump(as_json)
     if cmd and cmd not in ("-h", "--help", "help"):
