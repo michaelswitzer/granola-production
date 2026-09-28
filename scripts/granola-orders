@@ -10,10 +10,9 @@ granola-orders - read open Shopify orders and the colors picked on them.
                            summary showed of it, and nothing newer
   granola-orders undo <color> [cases|buttons]
                            take a check-off back
-  granola-orders count     how many open orders still have something to
-                           ship, as a bare number; reads, never writes
-  granola-orders pending   those orders, one line each with what is left
-                           to ship in it; reads, never writes
+  granola-orders pending   how many open orders still have something to
+                           ship, then one line each with what is left to
+                           ship in it; reads, never writes
   granola-orders dump      every open order, line item by line item,
                            with all of its properties (--json for raw)
 
@@ -415,17 +414,11 @@ def to_ship(orders):
     return out
 
 
-def cmd_count():
-    """The number of open orders with anything left unfulfilled. For the
-    dwl bar, which polls it: unlike summary, it leaves the state file
-    alone, so `done` still marks only what a summary actually showed."""
-    print(len(to_ship(open_orders())))
-    return 0
-
-
 def cmd_pending():
-    """What count counts, an order a line. For the card the dwl bar's
-    icon opens, and read-only for the same reason as count."""
+    """The open orders with anything left unfulfilled, counted and then an
+    order a line. For the dwl bar, which polls it for its icon and card:
+    unlike summary, it leaves the state file alone, so `done` still marks
+    only what a summary actually showed."""
     pending = to_ship(open_orders())
     print(f"{len(pending)} order(s) to ship")
     for o, items in pending:
@@ -505,8 +498,6 @@ def main():
         return cmd_done(args[1:])
     if cmd == "undo":
         return cmd_undo(args[1:])
-    if cmd == "count":
-        return cmd_count()
     if cmd == "pending":
         return cmd_pending()
     if cmd == "dump":
