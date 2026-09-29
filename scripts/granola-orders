@@ -80,11 +80,11 @@ MODELS = {
     },
 }
 
-# Spare button caps, sold as one product with a variant per type. The order
-# carries no color for them, so they are tallied under CAPS_COLOR, as the
-# same parts a controller's buttons are.
+# Spare button caps, sold as one product with a variant per type and one
+# Qikify color per line item. Each type is the same part as a controller's
+# buttons, and is tallied with them.
 CAPS_TITLE = "Button Caps"
-CAPS_COLOR = "Any color"
+CAPS_FIELD = "Gameplay button color"
 CAPS = {
     "24mm cap (Plateau)":     "Plateau button",
     "24mm cap (Beacon)":      "24mm button",
@@ -237,7 +237,12 @@ def parts_for(title, variant, attrs):
     if title == CAPS_TITLE:
         if variant not in CAPS:
             return [], [f"unknown cap '{variant}' -- not counted"]
-        return [("button", CAPS[variant], CAPS_COLOR, 1)], []
+        c = attrs.get(CAPS_FIELD, "").strip()
+        problems = [] if c else [f"missing '{CAPS_FIELD}'"]
+        problems += [f"unrecognised option '{k}: {v}'"
+                     for k, v in attrs.items()
+                     if not k.startswith("_") and k != CAPS_FIELD]
+        return ([("button", CAPS[variant], c, 1)] if c else []), problems
     model = MODELS.get(title)
     if model is None:
         return [], [f"unknown product '{title}' -- not counted"]
