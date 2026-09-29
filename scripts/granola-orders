@@ -80,6 +80,18 @@ MODELS = {
     },
 }
 
+# Spare button caps, sold as one product with a variant per type. The order
+# carries no color for them, so they are tallied under CAPS_COLOR, as the
+# same parts a controller's buttons are.
+CAPS_TITLE = "Button Caps"
+CAPS_COLOR = "Any color"
+CAPS = {
+    "24mm cap (Plateau)":     "Plateau button",
+    "24mm cap (Beacon)":      "24mm button",
+    "30mm cap (Beacon)":      "30mm button",
+    "1u square cap (Beacon)": "menu button",
+}
+
 # Products we ship but do not print, like a cable bought alongside a
 # controller: listed with their order, never flagged as unknown.
 ACCESSORIES = {"USB Cable"}
@@ -216,12 +228,16 @@ def cmd_dump(as_json):
     return 0
 
 
-def parts_for(title, attrs):
+def parts_for(title, variant, attrs):
     """The (kind, name, color, count) parts one unit of a line item needs,
     plus a list of problems. A problem means the tally for this item is
     incomplete, so the caller must show it rather than carry on quietly."""
     if title in ACCESSORIES:
         return [], []
+    if title == CAPS_TITLE:
+        if variant not in CAPS:
+            return [], [f"unknown cap '{variant}' -- not counted"]
+        return [("button", CAPS[variant], CAPS_COLOR, 1)], []
     model = MODELS.get(title)
     if model is None:
         return [], [f"unknown product '{title}' -- not counted"]
@@ -274,7 +290,7 @@ def needed(orders):
             if not qty:
                 continue
             attrs = {a["key"]: a["value"] for a in li["customAttributes"]}
-            parts, bad = parts_for(li["title"], attrs)
+            parts, bad = parts_for(li["title"], li["variantTitle"], attrs)
             problems += [f"{o['name']} {li['title']}: {p}" for p in bad]
             for kind, name, col, n in parts:
                 rows.append((li["id"], o["name"], kind, name, col, n * qty))
@@ -406,10 +422,12 @@ def cmd_summary(as_json):
 
 def to_ship(orders):
     """The open orders with anything left unfulfilled, each with its
-    unfulfilled line items as (quantity, title)."""
+    unfulfilled line items as (quantity, name), the name as Shopify gives
+    a variant: "Button Caps - 24mm cap (Plateau)"."""
     out = []
     for o in orders:
-        items = [(li["unfulfilledQuantity"], li["title"])
+        items = [(li["unfulfilledQuantity"],
+                  " - ".join(filter(None, (li["title"], li["variantTitle"]))))
                  for li in o["lineItems"]["nodes"]
                  if li["unfulfilledQuantity"]]
         if items:
