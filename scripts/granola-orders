@@ -11,8 +11,9 @@ granola-orders - read open Shopify orders and the colors picked on them.
   granola-orders undo <color> [cases|buttons]
                            take a check-off back
   granola-orders pending   how many open orders still have something to
-                           ship, then one line each with what is left to
-                           ship in it; reads, never writes
+                           ship, then one line each, oldest first: the
+                           day it was bought (mm/dd, local) and what is
+                           left to ship in it; reads, never writes
   granola-orders dump      every open order, line item by line item,
                            with all of its properties (--json for raw)
 
@@ -36,6 +37,7 @@ up as to print.
 Python stdlib only.
 """
 import sys, os, re, json, urllib.request, urllib.parse, urllib.error
+from datetime import datetime
 
 API_VERSION = "2026-07"
 ENV_FILE = os.path.expanduser("~/.config/granola/shopify.env")
@@ -440,9 +442,15 @@ def to_ship(orders):
     return out
 
 
+def bought(o):
+    """The order's createdAt as a local mm/dd."""
+    at = datetime.fromisoformat(o["createdAt"].replace("Z", "+00:00"))
+    return at.astimezone().strftime("%m/%d")
+
+
 def print_to_ship(pending):
     for o, items in pending:
-        print(f"  {o['name']}  "
+        print(f"  {o['name']}  {bought(o)}  "
               + ", ".join(f"{n}x {title}" for n, title in items))
 
 
