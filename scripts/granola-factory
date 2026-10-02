@@ -3,7 +3,8 @@
 #
 # granola-factory - open the three windows an order session needs, tiled.
 #
-#   the Shopify orders page, the slicer, and a terminal here
+#   the Shopify orders page, the slicer on Granola_Printer.3mf, and a
+#   terminal here
 #
 # Reached from the dwl app launcher on mod+space: nixos-config lists
 # "granola-factory" in menuApps, and this directory is already on PATH from
@@ -56,7 +57,7 @@ setsid -f foot -D "$here" sh -c 'scripts/granola-orders summary; exec "$SHELL"'
 # the script. The wait that actually matters is the slicer's, below.
 sleep 0.5
 
-setsid -f orca-slicer
+setsid -f orca-slicer "$here/Granola_Printer.3mf"
 
 # pkgs/orca-slicer-appimage in nixos-config forces GDK_BACKEND=x11, so the
 # slicer runs through XWayland and its windows are X windows -- which is the
