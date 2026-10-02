@@ -4,12 +4,12 @@
 # granola-factory - open the three windows an order session needs, tiled.
 #
 #   the Shopify orders page, the slicer on Granola_Printer.3mf, and a
-#   terminal here
+#   terminal here showing granola-orders summary
 #
 # Reached from the dwl app launcher on mod+space: nixos-config lists
 # "granola-factory" in menuApps, and this directory is already on PATH from
-# home.sessionPath, so the entry finds this file. Nothing about it is specific
-# to the launcher, though -- run it from a shell and it does the same thing.
+# home.sessionPath, so the entry finds this file. Run from a shell instead,
+# that shell's terminal is the third window rather than a new one.
 #
 # Not --pure, unlike the granola script next door. The three applications are
 # the session's own: foot comes from the dwl module and orca-slicer and the
@@ -44,20 +44,30 @@ url="https://admin.shopify.com/store/my-store/orders"
 # second after the browser appeared, every time. foot and LibreWolf happen to
 # sit through it, which is what made the slicer look like it was crashing on
 # its own. -f so setsid forks and returns rather than becoming the app.
-
 #
-# The terminal opens on what there is to print. foot runs the command in
-# place of the shell, so the shell is exec'd after it to leave a prompt under
-# the summary, and a failed summary (no network, a stale token) still does.
+# The two apps opened from here are cut off from this terminal too. A new
+# session does not take them off it, and the slicer in particular talks the
+# whole time it is up -- EGL and GTK warnings, a list of network interfaces --
+# which lands under the summary and over the prompt after it.
 
-setsid -f foot -D "$here" sh -c 'scripts/granola-orders summary; exec "$SHELL"'
+# The terminal is whichever one this was run from, when there is one: it
+# already exists, so it is pushed below the two windows opened here and lands
+# at the bottom of the stack, where it belongs, and the summary is printed
+# into it at the end. From the launcher there is no terminal, so one is opened
+# first, on the summary, as before. foot runs the command in place of the
+# shell, so the shell is exec'd after it to leave a prompt under the summary,
+# and a failed summary (no network, a stale token) still does.
+if [ ! -t 1 ]; then
+  setsid -f foot -D "$here" sh -c 'scripts/granola-orders summary; exec "$SHELL"'
 
-# Long enough only because the step after it takes seconds. foot maps in tens
-# of milliseconds, and this is a guess rather than a measurement -- the one in
-# the script. The wait that actually matters is the slicer's, below.
-sleep 0.5
+  # Long enough only because the step after it takes seconds. foot maps in
+  # tens of milliseconds, and this is a guess rather than a measurement --
+  # the one in the script. The wait that actually matters is the slicer's,
+  # below.
+  sleep 0.5
+fi
 
-setsid -f orca-slicer "$here/Granola_Printer.3mf"
+setsid -f orca-slicer "$here/Granola_Printer.3mf" </dev/null >/dev/null 2>&1
 
 # pkgs/orca-slicer-appimage in nixos-config forces GDK_BACKEND=x11, so the
 # slicer runs through XWayland and its windows are X windows -- which is the
@@ -103,4 +113,8 @@ done
 # running this routes through that instance and opens a window in it; with
 # nothing running it starts one. Either way the app_id stays "librewolf",
 # which is what the dwl opacity rule in nixos-config matches on.
-setsid -f librewolf --new-window "$url"
+setsid -f librewolf --new-window "$url" </dev/null >/dev/null 2>&1
+
+if [ -t 1 ]; then
+  cd "$here" && scripts/granola-orders summary
+fi
