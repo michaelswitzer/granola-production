@@ -7,10 +7,11 @@ granola-orders - read open Shopify orders and the colors picked on them.
                            (--json ok)
   granola-orders print     what to print, one line per color: its cases
                            and buttons (--json ok)
-  granola-orders assemble  what to put together, one block per controller
-                           build: its case and each button group's color,
-                           and the orders it is for; builds with nothing
-                           left to print come first (--json ok)
+  granola-orders assemble  what to put together and pack, one block per
+                           order: each controller with its case and button
+                           group colors, then cables and spare caps;
+                           orders with nothing left to print come first
+                           (--json ok)
   granola-orders done <color> [cases|buttons]
                            check a color off as printed -- what the last
                            summary or print showed of it, nothing newer
@@ -428,51 +429,65 @@ def show_print(rows, todo, done):
         print(f"\n  {'All open orders:':<{width}}  {items(parts)}")
 
 
-def builds(orders, todo):
-    """The controllers the open orders still need put together, identical
-    ones counted as one build: [{"ready", "model", "count", "orders",
-    "layout": [(label, color, count)]}]. A build is ready when none of its
-    parts are left to print. Ready builds first, then by model, then by
-    the oldest order waiting on them."""
+def assembly(orders, todo):
+    """What each open order still needs put together and packed, oldest
+    first: [{"order", "ready", "items": [{"count", "item", "color",
+    "layout"}]}]. An item is a line item left to ship: a controller with
+    its layout [(label, color, count)], or anything else that goes in the
+    box -- a cable, spare caps with their color -- controllers first.
+    An order is ready when none of its parts are left to print; ready
+    orders come first."""
     waiting = {r[0] for r in todo}
-    out = {}
+    out = []
     for o in orders:
+        items = []
         for li in o["lineItems"]["nodes"]:
             qty = li["unfulfilledQuantity"]
-            if not qty or li["title"] not in MODELS:
+            if not qty:
                 continue
             attrs = {a["key"]: a["value"] for a in li["customAttributes"]}
-            parts, _ = parts_for(li["title"], li["variantTitle"], attrs)
-            layout = tuple((label, col, n) for _, _, col, n, label in parts)
-            ready = li["id"] not in waiting
-            b = out.setdefault((ready, li["title"], layout), {
-                "ready": ready, "model": li["title"], "count": 0,
-                "orders": [], "layout": list(layout)})
-            b["count"] += qty
-            if o["name"] not in b["orders"]:
-                b["orders"].append(o["name"])
-    return sorted(out.values(),
-                  key=lambda b: (not b["ready"], b["model"]))
+            layout = None
+            if li["title"] in MODELS:
+                parts, _ = parts_for(li["title"], li["variantTitle"], attrs)
+                layout = [(label, col, n) for _, _, col, n, label in parts]
+            items.append({
+                "count": qty,
+                "item": " - ".join(filter(None, (li["title"],
+                                                 li["variantTitle"]))),
+                "color": (attrs.get(CAPS_FIELD) or None
+                          if li["title"] == CAPS_TITLE else None),
+                "layout": layout})
+        if items:
+            items.sort(key=lambda i: i["layout"] is None)
+            out.append({"order": o["name"], "items": items,
+                        "ready": not any(li["id"] in waiting
+                                         for li in o["lineItems"]["nodes"])})
+    return sorted(out, key=lambda a: not a["ready"])
 
 
-def show_assemble(bs):
-    """One build to a block: how many, the orders they are for, then a
-    line per part, where it goes and its color. Builds that still have
-    something to print are listed after, so the ready ones come first."""
+def show_assemble(orders):
+    """One order to a block: its number, then each thing in it -- a
+    controller followed by a line per part, where it goes and its color;
+    a cable or caps on one line. Orders that still have something to
+    print are listed after, so the ready ones come first."""
     print("To assemble")
-    if not bs:
-        print("  nothing -- no open order has a controller")
+    if not orders:
+        print("  nothing -- no open order")
         return
-    width = max(len(label) for b in bs for label, _, _ in b["layout"]) + 1
-    for i, b in enumerate(bs):
-        if i:
+    width = max((len(label) for a in orders for i in a["items"]
+                 for label, _, _ in i["layout"] or []), default=0) + 1
+    for k, a in enumerate(orders):
+        if k:
             print()
-        if not b["ready"] and (i == 0 or bs[i - 1]["ready"]):
-            print("  Still printing:")
-        print(f"  {b['count']}x {b['model']}  ({', '.join(b['orders'])})")
-        for label, col, n in b["layout"]:
-            count = f" ({n})" if n != 1 else ""
-            print(f"      {label + ':':<{width}}  {col}{count}")
+        if not a["ready"] and (k == 0 or orders[k - 1]["ready"]):
+            print("  Still printing:\n")
+        print(f"  {a['order']}")
+        for i in a["items"]:
+            color = f" in {i['color']}" if i["color"] else ""
+            print(f"    {i['count']}x {i['item']}{color}")
+            for label, col, n in i["layout"] or []:
+                count = f" ({n})" if n != 1 else ""
+                print(f"        {label + ':':<{width}}  {col}{count}")
 
 
 def report(problems):
@@ -487,11 +502,11 @@ def report(problems):
 def cmd_summary(as_json):
     orders = open_orders()
     rows, todo, done, problems = print_state(orders)
-    bs = builds(orders, todo)
+    todo_orders = assembly(orders, todo)
     if as_json:
         print(json.dumps({"orders": [o["name"] for o in orders],
                           **print_json(todo, done),
-                          "to_assemble": bs,
+                          "to_assemble": todo_orders,
                           "problems": problems}, indent=2))
         return 1 if problems else 0
     print(f"{len(orders)} open order(s): "
@@ -500,7 +515,7 @@ def cmd_summary(as_json):
     print()
     show_print(rows, todo, done)
     print()
-    show_assemble(bs)
+    show_assemble(todo_orders)
     return report(problems)
 
 
@@ -520,12 +535,12 @@ def cmd_assemble(as_json):
     orders = open_orders()
     rows, problems = needed(orders)
     todo, _ = split(rows, load_state()["printed"])
-    bs = builds(orders, todo)
+    todo_orders = assembly(orders, todo)
     if as_json:
-        print(json.dumps({"to_assemble": bs, "problems": problems},
-                         indent=2))
+        print(json.dumps({"to_assemble": todo_orders,
+                          "problems": problems}, indent=2))
         return 1 if problems else 0
-    show_assemble(bs)
+    show_assemble(todo_orders)
     return report(problems)
 
 

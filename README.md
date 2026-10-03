@@ -5,7 +5,7 @@ These are the tools used to build, test and ship Granola controllers.
 | Script | What it does |
 | --- | --- |
 | `scripts/granola` | Flashes a blank board and checks every input on a finished controller (Beacon, Plateau). |
-| `scripts/granola-orders` | Reads open Shopify orders and lists what to print, by color, what to assemble, by controller, and what is left to ship. |
+| `scripts/granola-orders` | Reads open Shopify orders and lists what to print, by color, what to assemble and pack, by order, and what is left to ship. |
 | `scripts/granola-factory` | Opens the Shopify orders page, the slicer on `Granola_Printer.3mf` and an order summary, tiled. |
 
 Each script prints its usage with `--help`.
