@@ -24,7 +24,8 @@ is the only scope this needs.
 
 Credentials live outside the repo, in ~/.config/granola/shopify.env:
 
-  SHOPIFY_STORE=my-store
+  SHOPIFY_STORE=my-store         the handle in admin.shopify.com/store/<handle>,
+                                 also used by granola-factory
   SHOPIFY_CLIENT_ID=...          from a Dev Dashboard app installed on the
   SHOPIFY_CLIENT_SECRET=...      store; traded for a 24h token every run
   # or instead:

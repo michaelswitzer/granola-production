@@ -19,8 +19,22 @@
 
 set -u
 
-here="$HOME/Documents/granola-production"
-url="https://admin.shopify.com/store/my-store/orders"
+# The repo is wherever this script is, a directory up from scripts/.
+here=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+
+# The store comes from the same file granola-orders reads its credentials
+# from, so it is named in one place and not in the repo. SHOPIFY_STORE may be
+# the bare handle or <handle>.myshopify.com; the admin URL wants the handle.
+# Without one, the bare admin URL still lands on the last store signed into.
+env_file="$HOME/.config/granola/shopify.env"
+store=$(sed -n 's/^[[:space:]]*SHOPIFY_STORE[[:space:]]*=//p' "$env_file" 2>/dev/null \
+  | tail -n 1 | tr -d "\"' \r")
+store=${store%.myshopify.com}
+if [ -n "$store" ]; then
+  url="https://admin.shopify.com/store/$store/orders"
+else
+  url="https://admin.shopify.com/"
+fi
 
 # Why the windows are opened in this order, which is backwards from how they
 # are read:
