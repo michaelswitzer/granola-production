@@ -63,6 +63,26 @@ Small mechanical changes get a one-line subject and no body -- `terminal
 colors, add local games share`. Reserve the long form for changes that made a
 decision.
 
+## The author
+
+Commits go out under the GitHub noreply address, never a personal email --
+these repos are public, or meant to be:
+
+```
+Mike Switzer <13549851+michaelswitzer@users.noreply.github.com>
+```
+
+The global git config still says otherwise, so do not trust it. Before the
+first commit, check `git config user.email`; if it is not the address above,
+set it for this repo:
+
+```
+git config user.name "Mike Switzer"
+git config user.email 13549851+michaelswitzer@users.noreply.github.com
+```
+
+and confirm with `git log -1 --format='%an <%ae>'` after committing.
+
 ## Pushing
 
 ```
