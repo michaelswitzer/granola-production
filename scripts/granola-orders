@@ -3,11 +3,17 @@
 """
 granola-orders - read open Shopify orders and the colors picked on them.
 
-  granola-orders summary   what to print for every open order, one line
-                           per color: its cases and buttons (--json ok)
+  granola-orders summary   the open orders, then both of the below
+                           (--json ok)
+  granola-orders print     what to print, one line per color: its cases
+                           and buttons (--json ok)
+  granola-orders assemble  what to put together, one block per controller
+                           build: its case and each button group's color,
+                           and the orders it is for; builds with nothing
+                           left to print come first (--json ok)
   granola-orders done <color> [cases|buttons]
                            check a color off as printed -- what the last
-                           summary showed of it, and nothing newer
+                           summary or print showed of it, nothing newer
   granola-orders undo <color> [cases|buttons]
                            take a check-off back
   granola-orders pending   how many open orders still have something to
@@ -232,8 +238,10 @@ def cmd_dump(as_json):
 
 
 def parts_for(title, variant, attrs):
-    """The (kind, name, color, count) parts one unit of a line item needs,
-    plus a list of problems. A problem means the tally for this item is
+    """The (kind, name, color, count, label) parts one unit of a line item
+    needs, plus a list of problems. The label says where on the controller
+    a part goes: "Case", "All buttons", or the Qikify field it was picked
+    in, less its " Color". A problem means the tally for this item is
     incomplete, so the caller must show it rather than carry on quietly."""
     if title in ACCESSORIES:
         return [], []
@@ -245,7 +253,7 @@ def parts_for(title, variant, attrs):
         problems += [f"unrecognised option '{k}: {v}'"
                      for k, v in attrs.items()
                      if not k.startswith("_") and k != CAPS_FIELD]
-        return ([("button", CAPS[variant], c, 1)] if c else []), problems
+        return ([("button", CAPS[variant], c, 1, variant)] if c else []), problems
     model = MODELS.get(title)
     if model is None:
         return [], [f"unknown product '{title}' -- not counted"]
@@ -260,7 +268,7 @@ def parts_for(title, variant, attrs):
 
     c = color(CASE_FIELD)
     if c:
-        parts.append(("case", f"{title} case", c, 1))
+        parts.append(("case", f"{title} case", c, 1, "Case"))
 
     groups = model["buttons"]
     if "all_buttons" in model:
@@ -269,12 +277,13 @@ def parts_for(title, variant, attrs):
         v = color(field)
         if v and v != PER_GROUP:
             groups = []
-            parts.append(("button", shape, v, count))
+            parts.append(("button", shape, v, count, "All buttons"))
     for field, shape, count in groups:
         used.add(field)
         v = color(field)
         if v:
-            parts.append(("button", shape, v, count))
+            parts.append(("button", shape, v, count,
+                          field.removesuffix(" Color")))
 
     extra = [k for k in attrs if not k.startswith("_") and k not in used]
     # A per-group field left over from a single-color order is Qikify
@@ -300,7 +309,7 @@ def needed(orders):
             attrs = {a["key"]: a["value"] for a in li["customAttributes"]}
             parts, bad = parts_for(li["title"], li["variantTitle"], attrs)
             problems += [f"{o['name']} {li['title']}: {p}" for p in bad]
-            for kind, name, col, n in parts:
+            for kind, name, col, n, _ in parts:
                 rows.append((li["id"], o["name"], kind, name, col, n * qty))
     return rows, problems
 
@@ -315,9 +324,9 @@ def needed(orders):
 # out of the open orders, and what was recorded for it is dropped with it.
 #
 #   printed   {line item id: {"kind|part|color": count}}
-#   shown     the to-print rows the last summary displayed. `done` marks
-#             only those, so an order that arrives between looking at the
-#             list and checking a color off is not marked printed unseen.
+#   shown     the to-print rows the last summary or print displayed. `done`
+#             marks only those, so an order that arrives between looking at
+#             the list and checking a color off is not marked printed unseen.
 
 STATE_FILE = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
@@ -376,36 +385,33 @@ def print_colors(rows, width):
         print(f"  {col + ':':<{width}}  {items(by_color[col])}")
 
 
-def cmd_summary(as_json):
-    orders = open_orders()
+def print_state(orders):
+    """What the open orders still need, divided into to print and printed,
+    for summary and print: they show the to-print rows, so they are what
+    `done` may check off. Also forgets line items no longer waiting:
+    shipped or cancelled."""
     rows, problems = needed(orders)
     state = load_state()
-    # Forget line items that are no longer waiting: shipped or cancelled.
     live = {r[0] for r in rows}
     state["printed"] = {li: p for li, p in state["printed"].items()
                         if li in live}
     todo, done = split(rows, state["printed"])
     state["shown"] = todo
     save_state(state)
+    return rows, todo, done, problems
 
-    if as_json:
-        row = lambda r: {"order": r[1], "kind": r[2], "part": r[3],
-                         "color": r[4], "count": r[5]}
-        print(json.dumps({
-            "orders": [o["name"] for o in orders],
-            "to_print": [row(r) for r in todo],
-            "printed": [row(r) for r in done],
-            "problems": problems,
-        }, indent=2))
-        return 1 if problems else 0
 
-    print(f"{len(orders)} open order(s): "
-          + ", ".join(o["name"] for o in orders))
-    print_to_ship(to_ship(orders))
+def print_json(todo, done):
+    row = lambda r: {"order": r[1], "kind": r[2], "part": r[3],
+                     "color": r[4], "count": r[5]}
+    return {"to_print": [row(r) for r in todo],
+            "printed": [row(r) for r in done]}
+
+
+def show_print(rows, todo, done):
     width = max((len(r[4]) for r in rows), default=0) + 1
     width = max(width, len("All open orders:"))
-
-    print("\nTo print")
+    print("To print")
     if todo:
         print_colors(todo, width)
     else:
@@ -420,12 +426,107 @@ def cmd_summary(as_json):
         parts[(kind, name)] = parts.get((kind, name), 0) + n
     if parts:
         print(f"\n  {'All open orders:':<{width}}  {items(parts)}")
+
+
+def builds(orders, todo):
+    """The controllers the open orders still need put together, identical
+    ones counted as one build: [{"ready", "model", "count", "orders",
+    "layout": [(label, color, count)]}]. A build is ready when none of its
+    parts are left to print. Ready builds first, then by model, then by
+    the oldest order waiting on them."""
+    waiting = {r[0] for r in todo}
+    out = {}
+    for o in orders:
+        for li in o["lineItems"]["nodes"]:
+            qty = li["unfulfilledQuantity"]
+            if not qty or li["title"] not in MODELS:
+                continue
+            attrs = {a["key"]: a["value"] for a in li["customAttributes"]}
+            parts, _ = parts_for(li["title"], li["variantTitle"], attrs)
+            layout = tuple((label, col, n) for _, _, col, n, label in parts)
+            ready = li["id"] not in waiting
+            b = out.setdefault((ready, li["title"], layout), {
+                "ready": ready, "model": li["title"], "count": 0,
+                "orders": [], "layout": list(layout)})
+            b["count"] += qty
+            if o["name"] not in b["orders"]:
+                b["orders"].append(o["name"])
+    return sorted(out.values(),
+                  key=lambda b: (not b["ready"], b["model"]))
+
+
+def show_assemble(bs):
+    """One build to a block: how many, the orders they are for, then a
+    line per part, where it goes and its color. Builds that still have
+    something to print are listed after, so the ready ones come first."""
+    print("To assemble")
+    if not bs:
+        print("  nothing -- no open order has a controller")
+        return
+    width = max(len(label) for b in bs for label, _, _ in b["layout"]) + 1
+    for i, b in enumerate(bs):
+        if i:
+            print()
+        if not b["ready"] and (i == 0 or bs[i - 1]["ready"]):
+            print("  Still printing:")
+        print(f"  {b['count']}x {b['model']}  ({', '.join(b['orders'])})")
+        for label, col, n in b["layout"]:
+            count = f" ({n})" if n != 1 else ""
+            print(f"      {label + ':':<{width}}  {col}{count}")
+
+
+def report(problems):
     if problems:
         print("\nNOT COUNTED -- fix these and rerun:", file=sys.stderr)
         for p in problems:
             print(f"  {p}", file=sys.stderr)
         return 1
     return 0
+
+
+def cmd_summary(as_json):
+    orders = open_orders()
+    rows, todo, done, problems = print_state(orders)
+    bs = builds(orders, todo)
+    if as_json:
+        print(json.dumps({"orders": [o["name"] for o in orders],
+                          **print_json(todo, done),
+                          "to_assemble": bs,
+                          "problems": problems}, indent=2))
+        return 1 if problems else 0
+    print(f"{len(orders)} open order(s): "
+          + ", ".join(o["name"] for o in orders))
+    print_to_ship(to_ship(orders))
+    print()
+    show_print(rows, todo, done)
+    print()
+    show_assemble(bs)
+    return report(problems)
+
+
+def cmd_print(as_json):
+    rows, todo, done, problems = print_state(open_orders())
+    if as_json:
+        print(json.dumps({**print_json(todo, done), "problems": problems},
+                         indent=2))
+        return 1 if problems else 0
+    show_print(rows, todo, done)
+    return report(problems)
+
+
+def cmd_assemble(as_json):
+    """Reads the check-offs but leaves the state file alone: it shows
+    nothing to print, so it must not change what `done` marks."""
+    orders = open_orders()
+    rows, problems = needed(orders)
+    todo, _ = split(rows, load_state()["printed"])
+    bs = builds(orders, todo)
+    if as_json:
+        print(json.dumps({"to_assemble": bs, "problems": problems},
+                         indent=2))
+        return 1 if problems else 0
+    show_assemble(bs)
+    return report(problems)
 
 
 def to_ship(orders):
@@ -478,16 +579,16 @@ def pick(rows, words):
 
 
 def cmd_done(words):
-    """Check a color off as printed: the rows of it the last summary showed."""
+    """Check a color off as printed: the rows of it the last summary or print showed."""
     state = load_state()
     if not words:
         die("Usage: granola-orders done <color> [cases|buttons]")
     rows = pick([tuple(r) for r in state["shown"]], list(words))
     if not rows:
         colors = sorted({r[4] for r in state["shown"]})
-        die(f"Nothing to print in '{' '.join(words)}' in the last summary."
+        die(f"Nothing to print in '{' '.join(words)}' in the last summary or print."
             + (f"\nColors to print: {', '.join(colors)}" if colors else
-               "\nRun 'granola-orders summary' first."))
+               "\nRun 'granola-orders print' first."))
     for li, order, kind, name, col, n in rows:
         p = state["printed"].setdefault(li, {})
         k = pkey(kind, name, col)
@@ -500,7 +601,7 @@ def cmd_done(words):
         counts[(kind, name)] = counts.get((kind, name), 0) + n
     print(f"Printed {rows[0][4]}: {items(counts)}  "
           f"({', '.join(sorted({r[1] for r in rows}))})\n")
-    return cmd_summary(False)
+    return cmd_print(False)
 
 
 def cmd_undo(words):
@@ -523,7 +624,7 @@ def cmd_undo(words):
     if not hit:
         die(f"Nothing in '{' '.join(words)}' is checked off.")
     save_state(state)
-    return cmd_summary(False)
+    return cmd_print(False)
 
 
 def main():
@@ -533,6 +634,10 @@ def main():
     cmd = args[0] if args else ""
     if cmd == "summary":
         return cmd_summary(as_json)
+    if cmd == "print":
+        return cmd_print(as_json)
+    if cmd == "assemble":
+        return cmd_assemble(as_json)
     if cmd == "done":
         return cmd_done(args[1:])
     if cmd == "undo":
